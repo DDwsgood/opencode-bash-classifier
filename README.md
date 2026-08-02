@@ -140,15 +140,13 @@ OPENAI_BASE_URL=https://api.deepseek.com/chat/completions
 OPENAI_MODEL=deepseek-v4-flash
 ```
 
-The `API_KEY` variable is left for you to fill in — the real key is never
-committed and never placed in plugin configuration, command arguments, or the
-review prompt. For backwards compatibility, `DEEPSEEK_API_KEY` is also accepted,
+The `API_KEY` variable is left for you to fill in. `DEEPSEEK_API_KEY` is also accepted,
 and both `API_KEY` and `DEEPSEEK_API_KEY` are read from `~/.env` as a fallback.
 Use `LLM_BASE_URL` / `LLM_MODEL` as aliases for the `OPENAI_*` variables.
-
+We suggest using offical DeepSeek provider + deepseeek-v4-flash for this classifier
 > **Provider note**: your provider must allow SDK/API calls with this key. Some
-> providers issue keys restricted to a specific official client or proxy; such
-> keys will not work with a direct OpenAI-compatible HTTP call.
+> providers issue keys restricted to some specific coding clientsy; such
+> keys using in this case may result in ban.
 
 The reviewer is fixed to:
 
@@ -164,6 +162,8 @@ reviewer policy repeats the recycle-bin override for inspected scripts and
 equivalent operations that the static classifier cannot prove: a pure move to the
 OS trash is always allowed, including for real project data, while emptying the
 trash is not.
+
+> Your provider&model must support JSON output in this case
 
 The reviewer is tool-enhanced:
 
