@@ -1,0 +1,48 @@
+{
+  "name": "opencode-bash-classifier",
+  "version": "0.3.0",
+  "description": "Execution-boundary command safety classifier for OpenCode's native Bash tool: static per-segment review plus a tool-enhanced OpenAI-compatible model reviewer.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./types/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./types/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/index.js",
+    "src",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin",
+    "test": "bun test",
+    "check": "bun run build && bun test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "bash",
+    "shell",
+    "security",
+    "command-classifier",
+    "llm-reviewer",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "engines": {
+    "opencode": ">=1.18.5"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.18.5"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.5",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.2"
+  }
+}

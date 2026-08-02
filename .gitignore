@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Secrets — never commit API keys
+.env
+.env.local
+.env.*.local
+# Dummy fixture used by the backup-policy tests (not a real secret)
+!test/fixtures/backup-policy/.env
+
+# opencode local state
+.opencode/
+
+# Local backups (test fixtures under test/fixtures/backup-policy are tracked)
+.backup/
+
+# IDEs / OS
+.idea
+.vscode
+.DS_Store
+Thumbs.db
