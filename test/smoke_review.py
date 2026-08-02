@@ -47,7 +47,7 @@ def run_case(label: str, review: dict) -> None:
     auditor._post_chat = tracked
     started = time.time()
     try:
-        result = auditor._run_review(json.dumps(review, ensure_ascii=False), review, auditor._load_dotenv_key())
+        result = auditor._run_review(json.dumps(review, ensure_ascii=False), review, auditor._load_api_key())
         status = f"{result['decision']}  {result['reason']}"
     except Exception as error:  # noqa: BLE001
         status = f"ERROR: {error}"
