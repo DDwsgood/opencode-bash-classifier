@@ -71,8 +71,9 @@ The local classifier:
   escapes, executing Temp content, or destructive process/service/system
   operations chained to the file operation; deletion follows the broader
   named-temp rule above;
-- recognizes exact `.backup` and `-backup` suffixes with optional trailing
-  decimal digits, such as `a.ts.backup2` and `project-backup10`;
+- recognizes exact `.backup`, `-backup`, `.bak`, and `-bak` suffixes with
+  optional trailing decimal digits, such as `a.ts.backup2`, `project-backup10`,
+  `data.json.bak2`, and `draft.bak`;
 - allows permanent backup deletion only when an exact same-directory original
   exists, both entries have the same filesystem type, and the backup creation
   time is strictly older than two minutes;

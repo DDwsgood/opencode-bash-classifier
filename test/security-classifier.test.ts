@@ -296,6 +296,55 @@ describe("static command security classifier", () => {
     ).toBe("ALLOW")
   })
 
+  test("allows verified deletion of .bak and -bak backups with the same policy", async () => {
+    const bakCreatedAt = await createdAt("report.csv.bak")
+    const result = await decisionAt("rm -f test/fixtures/backup-policy/report.csv.bak", bakCreatedAt + 120_001)
+    expect(result.verdict).toBe("ALLOW")
+    expect(result.rules).toEqual(["filesystem.backup-delete"])
+
+    const numberedCreatedAt = await createdAt("data.json.bak2")
+    expect(
+      (await decisionAt("rm -f test/fixtures/backup-policy/data.json.bak2", numberedCreatedAt + 120_001)).verdict,
+    ).toBe("ALLOW")
+    expect(
+      (
+        await decisionAt(
+          `Remove-Item -LiteralPath "test/fixtures/backup-policy/data.json.bak2" -Force`,
+          numberedCreatedAt + 120_001,
+        )
+      ).verdict,
+    ).toBe("ALLOW")
+  })
+
+  test("denies young, orphaned, and critical .bak deletion", async () => {
+    const bakCreatedAt = await createdAt("report.csv.bak")
+    const young = await decisionAt("rm -f test/fixtures/backup-policy/report.csv.bak", bakCreatedAt + 120_000)
+    expect(young.verdict).toBe("DENY")
+    expect(young.reason).toBe("Backup is not older than two minutes")
+
+    const orphanCreatedAt = await createdAt("orphan.json.bak")
+    const orphan = await decisionAt("rm -f test/fixtures/backup-policy/orphan.json.bak", orphanCreatedAt + 120_001)
+    expect(orphan.verdict).toBe("DENY")
+    expect(orphan.reason).toBe("Backup has no exact same-directory original")
+
+    const keyCritical = await decisionAt("rm -f test/fixtures/backup-policy/server.key.bak2")
+    expect(keyCritical.verdict).toBe("DENY")
+    expect(keyCritical.reason).toBe("Critical credential backups cannot be deleted")
+
+    const envCritical = await decisionAt("rm -f test/fixtures/backup-policy/.env.bak10")
+    expect(envCritical.verdict).toBe("DENY")
+  })
+
+  test("applies the same creation and move rules to .bak names", async () => {
+    const created = await decision("cp ./src/report.csv ./archive/report.csv.bak2")
+    expect(created.verdict).toBe("ALLOW")
+    expect(created.rules).toEqual(["filesystem.backup-copy"])
+    expect((await decision("mv ./project ./project-bak2")).verdict).toBe("DENY")
+    expect((await decision("mv ./project ./project.bak3")).verdict).toBe("DENY")
+    expect((await decision("touch ./data.json.bak2")).verdict).toBe("DENY")
+    expect((await decision("echo x > ./data.json.bak2")).verdict).toBe("DENY")
+  })
+
   test("denies young, unmatched, type-mismatched, and critical backup deletion", async () => {
     const reportBackup = "test/fixtures/backup-policy/report.csv.backup"
     const reportCreatedAt = await createdAt("report.csv.backup")

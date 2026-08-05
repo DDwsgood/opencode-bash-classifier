@@ -76,7 +76,7 @@ const WRAPPER_PRIMITIVE =
   /\b(?:eval|invoke-expression|iex)\b|(?:\b(?:bash|sh|zsh|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node)\b[^\n]{0,80}(?:\s-c|\s\/c|\s-command|\s-encodedcommand|\s-enc|\s-e))\b/i
 const SENSITIVE_ENV_FILE =
   /(?:^|[\\/\s"'=])\.env(?!\.(?:example|sample|template|dist)(?=$|[\\/\s"';&|]))(?:\.[A-Za-z0-9_-]+)?(?=$|[\\/\s"';&|])/i
-const BACKUP_SUFFIX_REFERENCE = /(?:\.backup|-backup)\d*(?=$|[\\/\s"';&|])/m
+const BACKUP_SUFFIX_REFERENCE = /(?:\.backup|-backup|\.bak|-bak)\d*(?=$|[\\/\s"';&|])/m
 
 function hasForcedRecursiveDelete(text: string) {
   const invocations =
@@ -321,7 +321,7 @@ function literalPathToken(value: string) {
 function backupPathIdentity(candidate: string) {
   const normalizedPath = candidate.replace(/[\\/]+$/, "")
   const name = path.basename(normalizedPath)
-  const match = name.match(/^(.*?)(?:\.backup|-backup)\d*$/)
+  const match = name.match(/^(.*?)(?:\.backup|-backup|\.bak|-bak)\d*$/)
   if (!match?.[1]) return undefined
   return {
     backupName: name,
@@ -844,20 +844,20 @@ function hasExplicitNonCopyBackupCreation(segment: string) {
   if (!BACKUP_SUFFIX_REFERENCE.test(value)) return false
   if (/^(?:touch|mkdir|new-item|set-content|out-file|tee|install)\b/i.test(value)) return true
   if (
-    /^tar\b[^\r\n;&|]*(?:-[A-Za-z]*f\s+|--file(?:=|\s+))(?:"[^"]*(?:\.backup|-backup)\d*"|'[^']*(?:\.backup|-backup)\d*'|[^\s;&|]*(?:\.backup|-backup)\d*)(?:\s|$)/i.test(
+    /^tar\b[^\r\n;&|]*(?:-[A-Za-z]*f\s+|--file(?:=|\s+))(?:"[^"]*(?:\.backup|-backup|\.bak|-bak)\d*"|'[^']*(?:\.backup|-backup|\.bak|-bak)\d*'|[^\s;&|]*(?:\.backup|-backup|\.bak|-bak)\d*)(?:\s|$)/i.test(
       value,
     )
   ) {
     return true
   }
   if (
-    /^zip\b(?:\s+-\S+)*\s+(?:"[^"]*(?:\.backup|-backup)\d*"|'[^']*(?:\.backup|-backup)\d*'|[^\s;&|]*(?:\.backup|-backup)\d*)(?:\s|$)/i.test(
+    /^zip\b(?:\s+-\S+)*\s+(?:"[^"]*(?:\.backup|-backup|\.bak|-bak)\d*"|'[^']*(?:\.backup|-backup|\.bak|-bak)\d*'|[^\s;&|]*(?:\.backup|-backup|\.bak|-bak)\d*)(?:\s|$)/i.test(
       value,
     )
   ) {
     return true
   }
-  return /(?:^|[^>])>\s*(?:"[^"]*(?:\.backup|-backup)\d*"|'[^']*(?:\.backup|-backup)\d*'|[^\s;&|]*(?:\.backup|-backup)\d*)(?:\s|$)/i.test(
+  return /(?:^|[^>])>\s*(?:"[^"]*(?:\.backup|-backup|\.bak|-bak)\d*"|'[^']*(?:\.backup|-backup|\.bak|-bak)\d*'|[^\s;&|]*(?:\.backup|-backup|\.bak|-bak)\d*)(?:\s|$)/i.test(
     value,
   )
 }
