@@ -16,9 +16,16 @@ quoting, process handling, permission checks, output capture, and TUI rendering.
 
 The plugin registers `tool.execute.before` and reviews only calls whose tool ID
 is `bash`. It never spawns the requested command itself and never rewrites the
-command text. As an optional hardening feature it may raise the bash tool's
-`timeout` ceiling for commands that are neither downloads nor builds (see
-Hard timeout below); the command string and its semantics are never touched.
+meaning of a command. Two optional hardening features touch the tool arguments:
+
+- it may raise the bash tool's `timeout` ceiling for commands that are neither
+  downloads nor builds (see Hard timeout below);
+- it may append a handle-isolating redirection to detached-start commands such
+  as `start` / `cmd /c start` / `Start-Process` (see Detached start isolation
+  below), which otherwise inherit the bash tool's pipe and hang the session.
+
+Neither changes what the command does; the command string is otherwise never
+touched.
 
 ```text
 native Bash request
@@ -143,9 +150,31 @@ the agent supplied:
   `npm run build`, `make`, `cargo build`, ...) are exempt and keep their
   timeout untouched.
 
-This is the only place the plugin writes to the bash tool arguments: it sets
-`timeout` only, and never wraps, prefixes, or rewrites the command. Set
-`hardTimeoutMs: 0` to disable the feature entirely.
+This sets the `timeout` argument only, and never wraps, prefixes, or rewrites
+the command. Set `hardTimeoutMs: 0` to disable the feature entirely.
+
+## Detached start isolation
+
+Commands like `start "" "app.exe"`, `cmd /c start ...`, and PowerShell
+`Start-Process` launch a **detached process** that inherits the bash tool's
+stdout/stderr pipe handles. OpenCode waits for that pipe to reach EOF, so even a
+command that returns immediately (e.g. `start "" "Docker Desktop.exe" && echo
+LAUNCHED`) hangs the session until the launched program exits.
+
+The plugin appends a handle-isolating redirection to the leading detached-start
+segment — `>/dev/null 2>&1` on bash, `> $null 2>&1` on PowerShell — so the
+detached process inherits null handles instead of the tool pipe. The command
+still launches and runs in the background, and OpenCode returns immediately:
+
+```text
+start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" && echo LAUNCHED
+  -> start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" >/dev/null 2>&1 && echo LAUNCHED
+```
+
+Only a leading `start` / `cmd ... /c start` / `Start-Process` / `Start-Job` is
+rewritten; commands that already redirect (`>` / `<`) and non-detached commands
+(`npm start`, `docker start`, ...) are untouched. Set
+`detachedStartIsolation: false` to disable.
 
 ## LLM reviewer setup
 
@@ -244,7 +273,8 @@ OpenCode supports plugin options using a tuple:
         "securityEnabled": true,
         "cloudReviewEnabled": true,
         "auditorTimeoutMs": 8000,
-        "hardTimeoutMs": 120000
+        "hardTimeoutMs": 120000,
+        "detachedStartIsolation": true
       }
     ]
   ]
@@ -256,6 +286,8 @@ OpenCode supports plugin options using a tuple:
 - `auditorTimeoutMs`: total Python reviewer timeout (tool rounds included); default `30000`
 - `hardTimeoutMs`: hard timeout ceiling (ms) for non-download/build commands;
   default `120000`; set `0` to disable
+- `detachedStartIsolation`: append handle isolation to `start`/`Start-Process`;
+  default `true`; set `false` to disable
 - `auditorPython`: explicit Python 3 executable
 - `auditorPath`: explicit path to `deepseek_auditor.py`
 - `shell`: optional classifier dialect hint only; it does not change which shell

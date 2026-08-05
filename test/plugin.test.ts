@@ -460,4 +460,89 @@ describe("OpenCode native Bash security hook", () => {
     ).rejects.toThrow("blocked")
     expect(args.timeout).toBe(600_000)
   })
+
+  test("isolates detached start commands so the pipe is not held open", async () => {
+    const hook = await beforeHook({
+      cloudReviewEnabled: false,
+      shell: "C:/msys64/usr/bin/bash.exe",
+    })
+    const cases: Array<[string, string]> = [
+      [
+        'start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" && echo LAUNCHED',
+        'start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" >/dev/null 2>&1 && echo LAUNCHED',
+      ],
+      ["start foo", "start foo >/dev/null 2>&1"],
+      ["cmd //c start foo", "cmd //c start foo >/dev/null 2>&1"],
+      ["Start-Process foo", "Start-Process foo >/dev/null 2>&1"],
+      ["Start-Process foo && echo done", "Start-Process foo >/dev/null 2>&1 && echo done"],
+      ["Start-Job { Start-Sleep 5 }", "Start-Job { Start-Sleep 5 } >/dev/null 2>&1"],
+    ]
+    for (const [command, expected] of cases) {
+      const args: Record<string, unknown> = { command }
+      await hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      )
+      expect(args.command, command).toBe(expected)
+    }
+  })
+
+  test("uses PowerShell null redirection for detached starts on pwsh", async () => {
+    const hook = await beforeHook({
+      cloudReviewEnabled: false,
+      shell: "C:/Program Files/PowerShell/7/pwsh.exe",
+    })
+    const args: Record<string, unknown> = { command: "Start-Process foo" }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.command).toBe("Start-Process foo > $null 2>&1")
+  })
+
+  test("does not touch commands that are not detached starts", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const commands = [
+      "npm start",
+      "docker start container-a",
+      "git status && ls -la",
+      "start foo > log.txt",
+      "start foo 2> err.txt",
+      "python server.py",
+    ]
+    for (const command of commands) {
+      const args: Record<string, unknown> = { command }
+      await hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      )
+      expect(args.command, command).toBe(command)
+    }
+  })
+
+  test("disables detached start isolation when configured off", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false, detachedStartIsolation: false })
+    const args: Record<string, unknown> = { command: "start foo" }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.command).toBe("start foo")
+  })
 })

@@ -1872,6 +1872,38 @@ export function isDownloadOrBuildCommand(script: string) {
   return DOWNLOAD_OR_BUILD_PATTERN.test(value)
 }
 
+function isPowerShellShellName(shell: string) {
+  const name = path.basename(shell).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase()
+  return name === "pwsh" || name === "powershell"
+}
+
+const DETACHED_START_PREFIX =
+  /^(?:Start-Process\b|Start-Job\b|start\b|cmd(?:\.exe)?\s+(?:\/\/c|\/c)\s+start\b)/i
+
+/**
+ * `start` / `cmd /c start` / `Start-Process` launch detached processes that
+ * inherit the bash tool's stdout/stderr pipe, so OpenCode waits for the pipe
+ * to reach EOF and the command hangs until the launched program exits. This
+ * rewrites the leading detached-start segment to redirect its handles away
+ * from the pipe, letting the tool return immediately while the launched
+ * program keeps running in the background.
+ */
+export function isolateDetachedStartCommand(command: string, shell: string) {
+  const value = command.trim()
+  const match = value.match(new RegExp(`^${DETACHED_START_PREFIX.source}([^;&|\\n]*)`, "i"))
+  if (!match) return command
+  const args = match[1] ?? ""
+  if (/[<>]/.test(args)) return command
+  const redirect = isPowerShellShellName(shell) ? "> $null 2>&1" : ">/dev/null 2>&1"
+  const rest = value.slice(match[0].length)
+  const separator = rest.match(/^\s*(&&|\|\||;|\||\r?\n)/)
+  if (!separator) return `${value} ${redirect}`
+  const sep = separator[1]
+  const tail = rest.slice(separator[0].length).trim()
+  const prefix = value.slice(0, match[0].length).trimEnd()
+  return `${prefix} ${redirect} ${sep} ${tail}`
+}
+
 export async function classifyShellCommand(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
   const source = normalized(input.script).trim()
   if (!source) {

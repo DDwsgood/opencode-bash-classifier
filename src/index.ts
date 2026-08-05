@@ -6,6 +6,7 @@ import { resolveClassifierShell } from "./shell-dialect"
 import {
   classifyShellCommand,
   isDownloadOrBuildCommand,
+  isolateDetachedStartCommand,
   verifyScriptFingerprints,
   type StaticSecurityDecision,
 } from "./security/classifier"
@@ -24,6 +25,7 @@ type BashSecurityOptions = PluginOptions & {
   auditorPython?: string
   auditorPath?: string
   hardTimeoutMs?: number
+  detachedStartIsolation?: boolean
   reviewCommand?: (request: CloudReviewRequest, options: ReviewCommandOptions) => Promise<CloudReviewResult>
 }
 
@@ -132,6 +134,7 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
     typeof options.hardTimeoutMs === "number" && Number.isFinite(options.hardTimeoutMs) && options.hardTimeoutMs >= 0
       ? options.hardTimeoutMs
       : DEFAULT_HARD_TIMEOUT_MS
+  const detachedStartIsolation = options.detachedStartIsolation !== false
   const auditorPython = typeof options.auditorPython === "string" ? options.auditorPython : undefined
   const auditorPath = typeof options.auditorPath === "string" ? options.auditorPath : undefined
   const reviewCommand = options.reviewCommand ?? reviewCommandWithDeepSeek
@@ -219,6 +222,13 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
         const hasExplicit = typeof original === "number" && Number.isFinite(original) && original > 0
         if (!hasExplicit || (original as number) > hardTimeoutMs) {
           ;(output.args as Record<string, unknown>).timeout = hardTimeoutMs
+        }
+      }
+
+      if (detachedStartIsolation) {
+        const isolated = isolateDetachedStartCommand(script, shell)
+        if (isolated !== script) {
+          ;(output.args as Record<string, unknown>).command = isolated
         }
       }
     },
