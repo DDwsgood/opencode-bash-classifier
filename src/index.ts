@@ -5,6 +5,7 @@ import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { resolveClassifierShell } from "./shell-dialect"
 import {
   classifyShellCommand,
+  isDownloadOrBuildCommand,
   verifyScriptFingerprints,
   type StaticSecurityDecision,
 } from "./security/classifier"
@@ -22,11 +23,13 @@ type BashSecurityOptions = PluginOptions & {
   auditorTimeoutMs?: number
   auditorPython?: string
   auditorPath?: string
+  hardTimeoutMs?: number
   reviewCommand?: (request: CloudReviewRequest, options: ReviewCommandOptions) => Promise<CloudReviewResult>
 }
 
 const DYNAMIC_ALLOW_CACHE_TTL_MS = 30 * 60 * 1000
 const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
+const DEFAULT_HARD_TIMEOUT_MS = 120_000
 
 function positiveInteger(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback
@@ -125,6 +128,10 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
   const securityEnabled = options.securityEnabled !== false
   const cloudReviewEnabled = options.cloudReviewEnabled !== false
   const auditorTimeoutMs = positiveInteger(options.auditorTimeoutMs, 30_000)
+  const hardTimeoutMs =
+    typeof options.hardTimeoutMs === "number" && Number.isFinite(options.hardTimeoutMs) && options.hardTimeoutMs >= 0
+      ? options.hardTimeoutMs
+      : DEFAULT_HARD_TIMEOUT_MS
   const auditorPython = typeof options.auditorPython === "string" ? options.auditorPython : undefined
   const auditorPath = typeof options.auditorPath === "string" ? options.auditorPath : undefined
   const reviewCommand = options.reviewCommand ?? reviewCommandWithDeepSeek
@@ -205,6 +212,14 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
 
       if (!(await verifyScriptFingerprints(staticDecision.fingerprints))) {
         throw staticBlock("Local script changed after review")
+      }
+
+      if (hardTimeoutMs > 0 && !isDownloadOrBuildCommand(script)) {
+        const original = (output.args as Record<string, unknown>).timeout
+        const hasExplicit = typeof original === "number" && Number.isFinite(original) && original > 0
+        if (!hasExplicit || (original as number) > hardTimeoutMs) {
+          ;(output.args as Record<string, unknown>).timeout = hardTimeoutMs
+        }
       }
     },
   }

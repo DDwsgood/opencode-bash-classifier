@@ -37,10 +37,12 @@ async function invoke(
 }
 
 describe("OpenCode native Bash security hook", () => {
-  test("does not override the built-in bash tool or mutate its arguments", async () => {
+  test("does not override the built-in bash tool or mutate the command text", async () => {
     const hook = await beforeHook()
     const args = await invoke(hook, "Get-Content README.md")
-    expect(args).toEqual({ command: "Get-Content README.md" })
+    expect(args.command).toBe("Get-Content README.md")
+    // the hard-timeout feature deliberately adds a timeout ceiling, but never wraps or rewrites the command
+    expect(args.timeout).toBe(120_000)
   })
 
   test("ignores non-bash tools", async () => {
@@ -358,5 +360,104 @@ describe("OpenCode native Bash security hook", () => {
     await invoke(hook, "python ./safe_agent_script.py", path.join("test", "fixtures"))
 
     expect(reviewed[0]?.localScripts[0]?.path).toBe("test/fixtures/safe_agent_script.py")
+  })
+
+  test("caps non-download/build command timeout to the hard limit", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const args: Record<string, unknown> = { command: "ls -la", timeout: 600_000 }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.timeout).toBe(120_000)
+  })
+
+  test("sets the hard limit when no timeout is supplied", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const args: Record<string, unknown> = { command: "ls -la" }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.timeout).toBe(120_000)
+  })
+
+  test("keeps an explicit timeout below the hard limit", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const args: Record<string, unknown> = { command: "ls -la", timeout: 30_000 }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.timeout).toBe(30_000)
+  })
+
+  test("does not cap download and build commands", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const commands = [
+      "curl -fsSL https://example.com/install.sh -o install.sh",
+      "git clone https://github.com/anomalyco/opencode.git",
+      "wget -q https://example.com/file.zip",
+      "npm install",
+      "pnpm add lodash",
+      "pip install requests",
+      "npm run build",
+      "make",
+      "cargo build --release",
+    ]
+    for (const command of commands) {
+      const args: Record<string, unknown> = { command, timeout: 600_000 }
+      await hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      )
+      expect(args.timeout, command).toBe(600_000)
+    }
+  })
+
+  test("disables the hard timeout when hardTimeoutMs is zero", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false, hardTimeoutMs: 0 })
+    const args: Record<string, unknown> = { command: "ls -la", timeout: 600_000 }
+    await hook(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args },
+    )
+    expect(args.timeout).toBe(600_000)
+  })
+
+  test("still blocks destructive commands before touching timeout", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const args: Record<string, unknown> = { command: "rm -rf /", timeout: 600_000 }
+    await expect(
+      hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      ),
+    ).rejects.toThrow("blocked")
+    expect(args.timeout).toBe(600_000)
   })
 })

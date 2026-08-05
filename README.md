@@ -15,8 +15,10 @@ quoting, process handling, permission checks, output capture, and TUI rendering.
 ## What it changes
 
 The plugin registers `tool.execute.before` and reviews only calls whose tool ID
-is `bash`. It never spawns the requested command itself and never mutates the
-native Bash arguments.
+is `bash`. It never spawns the requested command itself and never rewrites the
+command text. As an optional hardening feature it may raise the bash tool's
+`timeout` ceiling for commands that are neither downloads nor builds (see
+Hard timeout below); the command string and its semantics are never touched.
 
 ```text
 native Bash request
@@ -125,6 +127,26 @@ Command blocked by static classifier : <reason>
 Command blocked by dynamic classifier:<reason>
 ```
 
+## Hard timeout
+
+Commands that are neither **downloads** nor **builds** are capped at a hard
+timeout ceiling so a stuck or unexpectedly slow command cannot block the
+session pipeline indefinitely. The ceiling applies regardless of the timeout
+the agent supplied:
+
+- if the command has no explicit `timeout`, it is set to the ceiling
+  (2 minutes by default);
+- if the explicit `timeout` is larger than the ceiling, it is lowered to the
+  ceiling;
+- if the explicit `timeout` is already smaller than the ceiling, it is kept;
+- download and build commands (`curl`, `wget`, `git clone`, `npm install`,
+  `npm run build`, `make`, `cargo build`, ...) are exempt and keep their
+  timeout untouched.
+
+This is the only place the plugin writes to the bash tool arguments: it sets
+`timeout` only, and never wraps, prefixes, or rewrites the command. Set
+`hardTimeoutMs: 0` to disable the feature entirely.
+
 ## LLM reviewer setup
 
 Python 3 is required. The bundled auditor uses only the Python standard library
@@ -221,7 +243,8 @@ OpenCode supports plugin options using a tuple:
       {
         "securityEnabled": true,
         "cloudReviewEnabled": true,
-        "auditorTimeoutMs": 8000
+        "auditorTimeoutMs": 8000,
+        "hardTimeoutMs": 120000
       }
     ]
   ]
@@ -231,6 +254,8 @@ OpenCode supports plugin options using a tuple:
 - `securityEnabled`: enables the execution-boundary classifier; default `true`
 - `cloudReviewEnabled`: sends static `ASK` commands to the LLM reviewer; default `true`
 - `auditorTimeoutMs`: total Python reviewer timeout (tool rounds included); default `30000`
+- `hardTimeoutMs`: hard timeout ceiling (ms) for non-download/build commands;
+  default `120000`; set `0` to disable
 - `auditorPython`: explicit Python 3 executable
 - `auditorPath`: explicit path to `deepseek_auditor.py`
 - `shell`: optional classifier dialect hint only; it does not change which shell

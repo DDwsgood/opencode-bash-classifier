@@ -1846,6 +1846,32 @@ async function classifySegments(
   return combineSegmentDecisions(results)
 }
 
+const DOWNLOAD_OR_BUILD_PATTERN = new RegExp(
+  [
+    // Network download / transfer
+    String.raw`\b(?:curl|wget|wget2|aria2c|yt-dlp|gdown|scp|rsync|invoke-webrequest|iwr|irm)\b`,
+    String.raw`\bgit\s+(?:clone|fetch|pull|submodule\s+update)\b`,
+    String.raw`\bgh\s+repo\s+clone\b`,
+    String.raw`\b(?:hg|svn)\s+(?:clone|checkout|update)\b`,
+    // Package manager install / dependency fetch / download-and-run
+    String.raw`\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|ci)\b`,
+    String.raw`\b(?:npx|bunx|pnpm\s+dlx)\b`,
+    String.raw`\b(?:pip(?:3)?|pipx|uv)\s+install\b`,
+    String.raw`\b(?:cargo\s+(?:fetch|update|add)|go\s+(?:mod\s+download|get)|dotnet\s+(?:restore|add|tool\s+install))\b`,
+    String.raw`\b(?:apt(?:-get)?\s+install|apt-get\s+(?:update|dist-upgrade)|brew\s+(?:install|upgrade|bundle)|winget\s+install|scoop\s+install|choco\s+install|dnf\s+install|yum\s+install|pacman\s+(?:-S|--sync))\b`,
+    // Build / packaging
+    String.raw`\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|release)\b`,
+    String.raw`\b(?:mvnw?|maven|gradle|gradlew)\s+(?:clean\s+)?(?:build|package|install|compile|verify|test|assemble|bundle|jar|compileJava|deploy)\b`,
+    String.raw`\b(?:make|cmake\s+--build|meson\s+compile|ninja|cargo\s+build|go\s+build|dotnet\s+build|tsc|vite\s+build|webpack|rollup|esbuild|next\s+build|nuxt\s+build|svelte-kit\s+build)\b`,
+  ].join("|"),
+  "i",
+)
+
+export function isDownloadOrBuildCommand(script: string) {
+  const value = stripLeadingDirectoryChanges(script.trim())
+  return DOWNLOAD_OR_BUILD_PATTERN.test(value)
+}
+
 export async function classifyShellCommand(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
   const source = normalized(input.script).trim()
   if (!source) {
