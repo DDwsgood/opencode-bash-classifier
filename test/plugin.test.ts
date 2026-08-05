@@ -37,11 +37,12 @@ async function invoke(
 }
 
 describe("OpenCode native Bash security hook", () => {
-  test("does not override the built-in bash tool or mutate the command text", async () => {
-    const hook = await beforeHook()
+  test("does not override the built-in bash tool or rewrite the command meaning", async () => {
+    const hook = await beforeHook({ shell: "C:/msys64/usr/bin/bash.exe" })
     const args = await invoke(hook, "Get-Content README.md")
-    expect(args.command).toBe("Get-Content README.md")
-    // the hard-timeout feature deliberately adds a timeout ceiling, but never wraps or rewrites the command
+    // the hard-timeout feature wraps the command with a shell timeout, but the
+    // command text itself is preserved as the timeout argument
+    expect(args.command).toBe("timeout -k 3 120s Get-Content README.md")
     expect(args.timeout).toBe(120_000)
   })
 
@@ -464,6 +465,7 @@ describe("OpenCode native Bash security hook", () => {
   test("isolates detached start commands so the pipe is not held open", async () => {
     const hook = await beforeHook({
       cloudReviewEnabled: false,
+      hardTimeoutMs: 0,
       shell: "C:/msys64/usr/bin/bash.exe",
     })
     const cases: Array<[string, string]> = [
@@ -494,6 +496,7 @@ describe("OpenCode native Bash security hook", () => {
   test("uses PowerShell null redirection for detached starts on pwsh", async () => {
     const hook = await beforeHook({
       cloudReviewEnabled: false,
+      hardTimeoutMs: 0,
       shell: "C:/Program Files/PowerShell/7/pwsh.exe",
     })
     const args: Record<string, unknown> = { command: "Start-Process foo" }
@@ -509,7 +512,7 @@ describe("OpenCode native Bash security hook", () => {
   })
 
   test("does not touch commands that are not detached starts", async () => {
-    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const hook = await beforeHook({ cloudReviewEnabled: false, hardTimeoutMs: 0 })
     const commands = [
       "npm start",
       "docker start container-a",
@@ -544,5 +547,71 @@ describe("OpenCode native Bash security hook", () => {
       { args },
     )
     expect(args.command).toBe("start foo")
+  })
+
+  test("wraps non-download/build commands with a shell timeout as the real fallback", async () => {
+    const hook = await beforeHook({
+      cloudReviewEnabled: false,
+      shell: "C:/msys64/usr/bin/bash.exe",
+    })
+    const cases: Array<[string, string]> = [
+      ["ls -la", "timeout -k 3 120s ls -la"],
+      [
+        'ollama list 2>&1 | head -30; echo "---ENV---"; env | grep -i ollama',
+        'timeout -k 3 120s ollama list 2>&1 | head -30; echo "---ENV---"; env | grep -i ollama',
+      ],
+      ["cd /tmp && ollama list", "cd /tmp && timeout -k 3 120s ollama list"],
+      ["timeout 30 ping 1.1.1.1", "timeout 30 ping 1.1.1.1"],
+      ["start foo && echo done", "timeout -k 3 120s start foo >/dev/null 2>&1 && echo done"],
+    ]
+    for (const [command, expected] of cases) {
+      const args: Record<string, unknown> = { command }
+      await hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      )
+      expect(args.command, command).toBe(expected)
+    }
+  })
+
+  test("does not wrap downloads, builds, or PowerShell shells", async () => {
+    const hook = await beforeHook({ cloudReviewEnabled: false })
+    const commands = [
+      "npm install",
+      "curl -fsSL https://example.com/x",
+      "npm run build",
+      "git clone https://github.com/a/b.git",
+    ]
+    for (const command of commands) {
+      const args: Record<string, unknown> = { command }
+      await hook(
+        {
+          tool: "bash",
+          sessionID: "test-session",
+          callID: "test-call",
+        },
+        { args },
+      )
+      expect(args.command, command).toBe(command)
+    }
+
+    const pwsh = await beforeHook({
+      cloudReviewEnabled: false,
+      shell: "C:/Program Files/PowerShell/7/pwsh.exe",
+    })
+    const psArgs: Record<string, unknown> = { command: "Get-ChildItem" }
+    await pwsh(
+      {
+        tool: "bash",
+        sessionID: "test-session",
+        callID: "test-call",
+      },
+      { args: psArgs },
+    )
+    expect(psArgs.command).toBe("Get-ChildItem")
   })
 })

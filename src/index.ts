@@ -7,6 +7,7 @@ import {
   classifyShellCommand,
   isDownloadOrBuildCommand,
   isolateDetachedStartCommand,
+  wrapHardTimeoutCommand,
   verifyScriptFingerprints,
   type StaticSecurityDecision,
 } from "./security/classifier"
@@ -217,18 +218,23 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
         throw staticBlock("Local script changed after review")
       }
 
+      if (detachedStartIsolation) {
+        const isolated = isolateDetachedStartCommand(script, shell)
+        if (isolated !== script) {
+          ;(output.args as Record<string, unknown>).command = isolated
+        }
+      }
+
       if (hardTimeoutMs > 0 && !isDownloadOrBuildCommand(script)) {
         const original = (output.args as Record<string, unknown>).timeout
         const hasExplicit = typeof original === "number" && Number.isFinite(original) && original > 0
         if (!hasExplicit || (original as number) > hardTimeoutMs) {
           ;(output.args as Record<string, unknown>).timeout = hardTimeoutMs
         }
-      }
-
-      if (detachedStartIsolation) {
-        const isolated = isolateDetachedStartCommand(script, shell)
-        if (isolated !== script) {
-          ;(output.args as Record<string, unknown>).command = isolated
+        const current = (output.args as Record<string, unknown>).command as string
+        const wrapped = wrapHardTimeoutCommand(current, shell, hardTimeoutMs)
+        if (wrapped !== current) {
+          ;(output.args as Record<string, unknown>).command = wrapped
         }
       }
     },
