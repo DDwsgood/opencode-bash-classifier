@@ -150,21 +150,8 @@ the agent supplied:
   `npm run build`, `make`, `cargo build`, ...) are exempt and keep their
   timeout untouched.
 
-OpenCode's own `timeout` argument has proven unreliable on Windows for hung
-child processes (e.g. `ollama list` waiting on a dead service can block the
-session past the ceiling). As the real fallback, on bash-family shells the
-plugin also wraps the leading command in the shell `timeout` utility:
-
-```text
-ollama list 2>&1 | head -30; echo "---ENV---"; env | grep -i ollama
-  -> timeout -k 3 120s ollama list 2>&1 | head -30; echo "---ENV---"; env | grep -i ollama
-```
-
-`timeout -k 3 <sec>s ...` sends SIGTERM at the ceiling and SIGKILL 3 seconds
-later (Windows programs often ignore SIGTERM), so the hung child is terminated,
-the shell finishes, and OpenCode returns. `cd`-prefixed commands are wrapped
-after the `cd` chain, an existing leading `timeout` is left alone, and
-PowerShell shells are not wrapped. Set `hardTimeoutMs: 0` to disable.
+This sets the `timeout` argument only, and never wraps, prefixes, or rewrites
+the command. Set `hardTimeoutMs: 0` to disable the feature entirely.
 
 ## Detached start isolation
 

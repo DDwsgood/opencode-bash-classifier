@@ -1904,37 +1904,6 @@ export function isolateDetachedStartCommand(command: string, shell: string) {
   return `${prefix} ${redirect} ${sep} ${tail}`
 }
 
-function splitLeadingCd(command: string): { prefix: string; rest: string } {
-  let value = command.trim()
-  let prefix = ""
-  for (let index = 0; index < 4; index += 1) {
-    const match = value.match(/^((?:cd|pushd|set-location)\s+(?:"[^"]+"|'[^']+'|[^;&|]+)\s*&&\s*)/i)
-    if (!match) break
-    prefix += match[1]
-    value = value.slice(match[1].length)
-  }
-  return { prefix, rest: value }
-}
-
-/**
- * OpenCode's own `timeout` argument has proven unreliable on Windows for hung
- * child processes. This wraps the leading command in the shell `timeout` utility
- * (`timeout -k 3 <sec>s ...`), which forces the hung child to terminate after the
- * hard ceiling so the shell can finish and OpenCode can return. `-k 3` sends
- * SIGKILL shortly after SIGTERM because Windows programs often ignore SIGTERM.
- * The wrapper is idempotent and only applied to bash-family shells.
- */
-export function wrapHardTimeoutCommand(command: string, shell: string, timeoutMs: number) {
-  if (timeoutMs <= 0) return command
-  if (isPowerShellShellName(shell)) return command
-  const value = command.trim()
-  if (!value || /^timeout\b/i.test(value)) return command
-  const { prefix, rest } = splitLeadingCd(value)
-  if (!rest.trim()) return command
-  const seconds = Math.max(1, Math.ceil(timeoutMs / 1000))
-  return `${prefix}timeout -k 3 ${seconds}s ${rest.trim()}`
-}
-
 export async function classifyShellCommand(input: ClassifyShellCommandInput): Promise<StaticSecurityDecision> {
   const source = normalized(input.script).trim()
   if (!source) {
