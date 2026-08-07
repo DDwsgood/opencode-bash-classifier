@@ -1427,11 +1427,24 @@ function hasDataDestruction(text: string) {
   )
 }
 
+function hasDestructiveOpenOverwrite(text: string) {
+  const pattern = /\bopen\s*\([^)]*\)/gi
+  let match: RegExpExecArray | null
+  while ((match = pattern.exec(text)) !== null) {
+    const call = match[0]
+    if (!/\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(call)) continue
+    if (/mode\s*=\s*["'][wax]/i.test(call)) return true
+    if (/["'][wax][b+]*["']/.test(call)) return true
+  }
+  return false
+}
+
 function hasDestructiveOverwrite(text: string) {
   return (
     /\bsed\b[^\n]*-i\b[^\n]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
     /\b(?:set-content|out-file)\b[^\n]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
-    /\b(?:open|write_text|write_bytes)\s*\([^)]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text)
+    /\b(?:write_text|write_bytes)\s*\([^)]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
+    hasDestructiveOpenOverwrite(text)
   )
 }
 

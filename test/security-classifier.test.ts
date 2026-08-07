@@ -454,6 +454,33 @@ describe("static command security classifier", () => {
     expect(flaggedPython.reviewContext?.localScripts[0]?.path).toBe("test/fixtures/safe_agent_script.py")
   })
 
+  test("allows read-only open(...) while still denying write modes on data files", async () => {
+    const readOnly = [
+      `python -c "with open('data.csv', 'r') as f: print(f.read())"`,
+      `python -c "with open('data.json', 'r') as f: print(f.read())"`,
+      `python -c "with open('data.csv', 'rb') as f: print(f.read())"`,
+      `python -c "with open('data.csv') as f: print(f.read())"`,
+      `python -c "with open('notes.txt', 'r') as f: print(f.read())"`,
+    ]
+    for (const script of readOnly) {
+      const result = await decision(script)
+      expect(result.verdict, script).not.toBe("DENY")
+      expect(result.rules, script).not.toContain("data.destructive-overwrite")
+    }
+
+    const writeModes = [
+      `python -c "with open('data.csv', 'w') as f: f.write('x')"`,
+      `python -c "with open('data.csv', mode='w') as f: f.write('x')"`,
+      `python -c "with open('data.csv', 'wb+') as f: f.write('x')"`,
+      `python -c "with open('data.csv', 'a') as f: f.write('x')"`,
+    ]
+    for (const script of writeModes) {
+      const result = await decision(script)
+      expect(result.verdict, script).toBe("DENY")
+      expect(result.rules, script).toContain("data.destructive-overwrite")
+    }
+  })
+
   test("includes a bounded ls-style snapshot for a directory deletion sent to cloud review", async () => {
     const result = await decision("Remove-Item -Recurse .")
     expect(result.verdict).toBe("ASK")
