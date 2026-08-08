@@ -362,7 +362,7 @@ describe("OpenCode native Bash security hook", () => {
     expect(reviewed[0]?.localScripts[0]?.path).toBe("test/fixtures/safe_agent_script.py")
   })
 
-  test("caps non-download/build command timeout to the hard limit", async () => {
+  test("preserves an explicit timeout above the default limit", async () => {
     const hook = await beforeHook({ cloudReviewEnabled: false })
     const args: Record<string, unknown> = { command: "ls -la", timeout: 600_000 }
     await hook(
@@ -373,7 +373,7 @@ describe("OpenCode native Bash security hook", () => {
       },
       { args },
     )
-    expect(args.timeout).toBe(120_000)
+    expect(args.timeout).toBe(600_000)
   })
 
   test("sets the hard limit when no timeout is supplied", async () => {
@@ -541,6 +541,32 @@ describe("OpenCode native Bash security hook", () => {
         sessionID: "test-session",
         callID: "test-call",
       },
+      { args },
+    )
+    expect(args.command).toBe("start foo")
+  })
+
+  test("uses the supervisor as the live shell without rewriting commands", async () => {
+    const realShell = "C:/msys64/usr/bin/bash.exe"
+    const hooks = await BashSummaryPlugin(context(), {
+      cloudReviewEnabled: false,
+      shell: realShell,
+      supervisorPath: process.execPath,
+    })
+    const config = { shell: realShell }
+    await hooks.config?.(config as never)
+    expect(config.shell).toBe(path.resolve(process.execPath))
+
+    const env = { env: {} as Record<string, string> }
+    await hooks["shell.env"]?.(
+      { cwd: process.cwd(), sessionID: "test-session", callID: "test-call" },
+      env,
+    )
+    expect(env.env.OPENCODE_REAL_BASH).toBe(realShell)
+
+    const args: Record<string, unknown> = { command: "start foo" }
+    await hooks["tool.execute.before"]?.(
+      { tool: "bash", sessionID: "test-session", callID: "test-call" },
       { args },
     )
     expect(args.command).toBe("start foo")

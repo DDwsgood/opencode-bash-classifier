@@ -134,18 +134,48 @@ Command blocked by static classifier : <reason>
 Command blocked by dynamic classifier:<reason>
 ```
 
-## Hard timeout
+## Windows process supervisor
 
-Commands that are neither **downloads** nor **builds** are capped at a hard
-timeout ceiling so a stuck or unexpectedly slow command cannot block the
-session pipeline indefinitely. The ceiling applies regardless of the timeout
-the agent supplied:
+On Windows, OpenCode 1.x can keep waiting after a shell exits when a descendant
+inherits its stdout/stderr pipe. Its timeout cleanup can hit the same wait. The
+optional native supervisor fixes that process boundary without changing the
+agent's command:
+
+- the real shell starts suspended and enters a Windows Job Object before it can
+  create descendants;
+- it inherits private relay pipes, never OpenCode's pipe handles;
+- normal shell exit gets a bounded 300 ms output drain and does not wait for a
+  detached descendant;
+- forced supervisor termination closes a `KILL_ON_JOB_CLOSE` job and terminates
+  the Windows process tree.
+
+Build it once before rebuilding/restarting OpenCode:
+
+```bash
+bun run build:supervisor
+```
+
+On Windows it is enabled automatically when the executable exists. Missing or
+disabled supervisors fall back to OpenCode's configured shell; a supervisor
+that starts but cannot create/assign the real shell exits with code 125 rather
+than silently running outside the Job boundary. Set
+`supervisorEnabled: false` to disable or `supervisorPath` to use another build.
+`OPENCODE_REAL_BASH` is supplied internally to tool and PTY processes.
+
+The executable is named `bash.exe` so OpenCode keeps its Bash-specific argument
+and login-shell behavior. Interactive terminal invocations inherit their PTY
+stdio and launch the real Bash directly; private relay pipes and Job cleanup
+apply to non-interactive command execution.
+
+## Default timeout guard
+
+Commands that are neither **downloads** nor **builds** receive a default
+timeout when the agent omitted one:
 
 - if the command has no explicit `timeout`, it is set to the ceiling
   (2 minutes by default);
-- if the explicit `timeout` is larger than the ceiling, it is lowered to the
-  ceiling;
-- if the explicit `timeout` is already smaller than the ceiling, it is kept;
+- any explicit positive `timeout` is preserved, including values above the
+  default;
 - download and build commands (`curl`, `wget`, `git clone`, `npm install`,
   `npm run build`, `make`, `cargo build`, ...) are exempt and keep their
   timeout untouched.
@@ -153,7 +183,7 @@ the agent supplied:
 This sets the `timeout` argument only, and never wraps, prefixes, or rewrites
 the command. Set `hardTimeoutMs: 0` to disable the feature entirely.
 
-## Detached start isolation
+## Detached start isolation fallback
 
 Commands like `start "" "app.exe"`, `cmd /c start ...`, and PowerShell
 `Start-Process` launch a **detached process** that inherits the bash tool's
@@ -161,7 +191,7 @@ stdout/stderr pipe handles. OpenCode waits for that pipe to reach EOF, so even a
 command that returns immediately (e.g. `start "" "Docker Desktop.exe" && echo
 LAUNCHED`) hangs the session until the launched program exits.
 
-The plugin appends a handle-isolating redirection to the leading detached-start
+When the Windows supervisor is not active, the plugin appends a handle-isolating redirection to the leading detached-start
 segment — `>/dev/null 2>&1` on bash, `> $null 2>&1` on PowerShell — so the
 detached process inherits null handles instead of the tool pipe. The command
 still launches and runs in the background, and OpenCode returns immediately:
@@ -274,7 +304,8 @@ OpenCode supports plugin options using a tuple:
         "cloudReviewEnabled": true,
         "auditorTimeoutMs": 8000,
         "hardTimeoutMs": 120000,
-        "detachedStartIsolation": true
+        "detachedStartIsolation": true,
+        "supervisorEnabled": true
       }
     ]
   ]
@@ -284,14 +315,16 @@ OpenCode supports plugin options using a tuple:
 - `securityEnabled`: enables the execution-boundary classifier; default `true`
 - `cloudReviewEnabled`: sends static `ASK` commands to the LLM reviewer; default `true`
 - `auditorTimeoutMs`: total Python reviewer timeout (tool rounds included); default `30000`
-- `hardTimeoutMs`: hard timeout ceiling (ms) for non-download/build commands;
-  default `120000`; set `0` to disable
+- `hardTimeoutMs`: default timeout (ms) for non-download/build commands that do
+  not provide one; default `120000`; set `0` to disable
 - `detachedStartIsolation`: append handle isolation to `start`/`Start-Process`;
-  default `true`; set `false` to disable
+  default `true`; used only when the supervisor is inactive
+- `supervisorEnabled`: use the native Windows shell supervisor when its
+  executable exists; default `true` on Windows
+- `supervisorPath`: explicit path to the supervisor `bash.exe`
 - `auditorPython`: explicit Python 3 executable
 - `auditorPath`: explicit path to `deepseek_auditor.py`
-- `shell`: optional classifier dialect hint only; it does not change which shell
-  OpenCode executes
+- `shell`: optional real-shell override and classifier dialect hint
 
 ## Security boundaries
 

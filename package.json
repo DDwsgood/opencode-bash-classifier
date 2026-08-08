@@ -14,13 +14,16 @@
   "files": [
     "dist/index.js",
     "src",
+    "native/windows-bash-supervisor",
     "types",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin",
+    "build:supervisor": "cargo build --release --manifest-path ./native/windows-bash-supervisor/Cargo.toml",
     "test": "bun test",
+    "test:supervisor": "node ./native/windows-bash-supervisor/test/integration.mjs ./native/windows-bash-supervisor/target/release/bash.exe",
     "check": "bun run build && bun test"
   },
   "keywords": [

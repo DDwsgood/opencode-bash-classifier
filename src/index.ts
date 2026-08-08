@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto"
 import path from "node:path"
-import { realpath } from "node:fs/promises"
+import { access, realpath } from "node:fs/promises"
+import { fileURLToPath } from "node:url"
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { resolveClassifierShell } from "./shell-dialect"
 import {
@@ -26,12 +27,23 @@ type BashSecurityOptions = PluginOptions & {
   auditorPath?: string
   hardTimeoutMs?: number
   detachedStartIsolation?: boolean
+  supervisorEnabled?: boolean
+  supervisorPath?: string
   reviewCommand?: (request: CloudReviewRequest, options: ReviewCommandOptions) => Promise<CloudReviewResult>
 }
 
 const DYNAMIC_ALLOW_CACHE_TTL_MS = 30 * 60 * 1000
 const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
 const DEFAULT_HARD_TIMEOUT_MS = 120_000
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
+const DEFAULT_SUPERVISOR_PATH = path.join(
+  PACKAGE_ROOT,
+  "native",
+  "windows-bash-supervisor",
+  "target",
+  "release",
+  "bash.exe",
+)
 
 function positiveInteger(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback
@@ -135,18 +147,36 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
       ? options.hardTimeoutMs
       : DEFAULT_HARD_TIMEOUT_MS
   const detachedStartIsolation = options.detachedStartIsolation !== false
+  const supervisorEnabled = process.platform === "win32" && options.supervisorEnabled !== false
+  const supervisorPath = path.resolve(
+    typeof options.supervisorPath === "string" ? options.supervisorPath : DEFAULT_SUPERVISOR_PATH,
+  )
   const auditorPython = typeof options.auditorPython === "string" ? options.auditorPython : undefined
   const auditorPath = typeof options.auditorPath === "string" ? options.auditorPath : undefined
   const reviewCommand = options.reviewCommand ?? reviewCommandWithDeepSeek
   const directory = await canonicalOrResolved(pluginContext.directory)
   const worktree = await canonicalOrResolved(pluginContext.worktree)
   const dynamicAllowCache = new Map<string, number>()
+  let supervisorActive = false
 
   return {
     config: async (config) => {
       if (!configuredShell && typeof (config as { shell?: unknown }).shell === "string") {
         configuredShell = (config as { shell: string }).shell
       }
+      if (!supervisorEnabled || !configuredShell || path.resolve(configuredShell) === supervisorPath) return
+      try {
+        await access(supervisorPath)
+      } catch {
+        return
+      }
+      ;(config as { shell?: string }).shell = supervisorPath
+      process.env.OPENCODE_REAL_BASH = configuredShell
+      supervisorActive = true
+    },
+    "shell.env": async (_input, output) => {
+      if (!supervisorActive || !configuredShell) return
+      output.env.OPENCODE_REAL_BASH = configuredShell
     },
     "tool.execute.before": async (input, output) => {
       if (input.tool !== "bash" || !securityEnabled) return
@@ -220,12 +250,12 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
       if (hardTimeoutMs > 0 && !isDownloadOrBuildCommand(script)) {
         const original = (output.args as Record<string, unknown>).timeout
         const hasExplicit = typeof original === "number" && Number.isFinite(original) && original > 0
-        if (!hasExplicit || (original as number) > hardTimeoutMs) {
+        if (!hasExplicit) {
           ;(output.args as Record<string, unknown>).timeout = hardTimeoutMs
         }
       }
 
-      if (detachedStartIsolation) {
+      if (detachedStartIsolation && !supervisorActive) {
         const isolated = isolateDetachedStartCommand(script, shell)
         if (isolated !== script) {
           ;(output.args as Record<string, unknown>).command = isolated
