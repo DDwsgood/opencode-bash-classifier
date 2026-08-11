@@ -88,6 +88,20 @@ const GENERAL_DATA_EXTENSION =
   /\.(?:csv|jsonl?|ya?ml|toml|ini|db|sqlite(?:3)?|sql|parquet|avro|xlsx?|docx?|pptx?|pdf)(?=$|[\s"';&|)])/i
 const DELETE_PRIMITIVE =
   /\b(?:rm|ri|del|erase|rmdir|rd|remove-item|clear-content|unlink|unlinkSync|rmSync|rmtree|os\.remove|os\.unlink|shutil\.rmtree)\b|(?:^|\s)-delete(?:\s|$)|\.unlink\s*\(/i
+const SCRIPT_DESTRUCTIVE_PRIMITIVE = new RegExp(
+  [
+    // Shell deletion / process-kill commands, matched on raw text including inside quoted string literals
+    String.raw`\b(?:rm|rmdir|rd|del|erase|ri|remove-item|clear-content|shred|unlink|unlinksync|rmsync|rmtree|removedirs|rimraf|send2trash|kill|pkill|killall|taskkill|stop-process)\b`,
+    String.raw`\b(?:trash-put|trash-cli|trash-empty|trash-rm)\b|\bgio\s+trash\b`,
+    // Python / Node deletion and kill APIs
+    String.raw`\bos\.(?:remove|unlink|rmdir|removedirs|kill)\b`,
+    String.raw`\bshutil\.rmtree\b`,
+    String.raw`\bfs(?:\.promises)?\.(?:rm|unlink|rmdir)(?:sync)?\s*\(`,
+    String.raw`\.(?:unlink|rmdir|rmSync|unlinkSync|kill|terminate)\s*\(`,
+    String.raw`(?:^|\s)-delete(?:\s|$)`,
+  ].join("|"),
+  "i",
+)
 const WRAPPER_PRIMITIVE =
   /\b(?:eval|invoke-expression|iex)\b|(?:\b(?:bash|sh|zsh|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node)\b[^\n]{0,80}(?:\s-c|\s\/c|\s-command|\s-encodedcommand|\s-enc|\s-e))\b/i
 const SENSITIVE_ENV_FILE =
@@ -1938,8 +1952,10 @@ function hasFileWritePrimitive(text: string): boolean {
 }
 
 function hasLocalScriptReviewSignal(text: string): boolean {
-  if (hasDeletePrimitive(text)) return true
-  if (/\b(?:kill|pkill|killall|taskkill|stop-process)\b/i.test(text)) return true
+  // Script content is matched raw: quote stripping is only safe for command text,
+  // where extractQuotedWrappers re-surfaces quoted payloads; string literals inside
+  // a script file have no such secondary surface, so stripping would hide payloads.
+  if (SCRIPT_DESTRUCTIVE_PRIMITIVE.test(text)) return true
   if (hasFileWritePrimitive(text)) return true
   return false
 }

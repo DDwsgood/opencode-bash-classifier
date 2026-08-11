@@ -544,6 +544,35 @@ describe("static command security classifier", () => {
     }
   })
 
+  test("asks for local scripts whose destructive primitives appear only inside quoted string literals", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "clf-quoted-signal-"))
+
+    const scripts: Array<[string, string]> = [
+      ["del_in_quotes.py", 'import subprocess\nsubprocess.run(["cmd", "/c", "del", target])\n'],
+      ["os_system_rm.py", 'import os\nos.system("rm " + path)\n'],
+      ["send2trash.py", "import send2trash\nsend2trash(path)\n"],
+      ["removedirs.py", "import os\nos.removedirs(d)\n"],
+      ["pathlib_unlink.py", "from pathlib import Path\nPath(p).unlink()\n"],
+    ]
+
+    try {
+      for (const [fileName, content] of scripts) {
+        const scriptPath = path.join(dir, fileName)
+        writeFileSync(scriptPath, content)
+        const result = await classifyShellCommand({
+          cwd: dir,
+          worktree: dir,
+          shell: context.shell,
+          script: `python ${scriptPath}`,
+        })
+        expect(result.verdict, fileName).toBe("ASK")
+        expect(result.rules, fileName).toContain("execution.local-script-signal")
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("allows read-only open(...) while asking for write modes on data files", async () => {
     const readOnly = [
       `python -c "with open('data.csv', 'r') as f: print(f.read())"`,
