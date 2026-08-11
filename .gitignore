@@ -11,6 +11,9 @@ __pycache__/
 **/__pycache__/
 *.pyc
 
+# Local test suite
+test/
+
 # Secrets — never commit API keys
 .env
 .env.local

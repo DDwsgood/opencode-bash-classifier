@@ -1,6 +1,6 @@
 {
   "name": "opencode-bash-classifier",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Execution-boundary command safety classifier for OpenCode's native Bash tool: static per-segment review plus a tool-enhanced OpenAI-compatible model reviewer.",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,18 +13,28 @@
   },
   "files": [
     "dist/index.js",
-    "src",
-    "native/windows-bash-supervisor",
-    "types",
+    "src/index.ts",
+    "src/config.ts",
+    "src/shell-dialect.ts",
+    "src/security/classifier.ts",
+    "src/security/reviewer.ts",
+    "src/security/auditor.py",
+    "native/windows-bash-supervisor/Cargo.toml",
+    "native/windows-bash-supervisor/Cargo.lock",
+    "native/windows-bash-supervisor/src/main.rs",
+    "native/windows-bash-supervisor/README.md",
+    "types/index.d.ts",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "bun build ./src/index.ts --outdir ./dist --target bun --format esm --external @opencode-ai/plugin",
     "build:supervisor": "cargo build --release --manifest-path ./native/windows-bash-supervisor/Cargo.toml",
     "test": "bun test",
+    "test:auditor": "python test/test_auditor_tools.py",
     "test:supervisor": "node ./native/windows-bash-supervisor/test/integration.mjs ./native/windows-bash-supervisor/target/release/bash.exe",
-    "check": "bun run build && bun test"
+    "check": "bun run build && bun test && bun run test:auditor"
   },
   "keywords": [
     "opencode",

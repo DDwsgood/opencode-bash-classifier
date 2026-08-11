@@ -34,6 +34,8 @@ export type StaticReviewContext = {
   uninspectedLocalScripts: string[]
   targetDirectories: TargetDirectoryReviewContext[]
   uninspectedTargetDirectories: string[]
+  referencedPaths: string[]
+  referencedPathsTruncated: boolean
 }
 
 export type StaticSecurityDecision = {
@@ -44,6 +46,8 @@ export type StaticSecurityDecision = {
   reviewContext?: StaticReviewContext
 }
 
+export type Strictness = "LOOSE" | "HARD"
+
 export type ClassifyShellCommandInput = {
   script: string
   cwd: string
@@ -51,6 +55,12 @@ export type ClassifyShellCommandInput = {
   shell: string
   nowMs?: number
   trustedTempRoot?: string
+  strictness?: Strictness
+}
+
+type InternalClassifyInput = ClassifyShellCommandInput & {
+  /** The effective working directory of this segment is not statically known. */
+  cwdUnknown?: boolean
 }
 
 const MAX_COMMAND_CHARS = 128_000
@@ -59,9 +69,12 @@ const MAX_CLOUD_LOCAL_SCRIPT_CHARS = 256_000
 const MAX_LOCAL_SCRIPTS = 8
 const MAX_DECODED_PAYLOADS = 8
 const MAX_TARGET_DIRECTORIES = 4
+const MAX_REFERENCED_PATHS = 32
 const MAX_DIRECTORY_ENTRIES = 200
 const MAX_DIRECTORY_ENTRY_NAME_CHARS = 512
 const MIN_BACKUP_AGE_MS = 2 * 60 * 1000
+const PERMANENT_DELETE_GUIDANCE =
+  "DO NOT retry with rm, Remove-Item, recycle-bin deletion, or an equivalent deletion command"
 
 type Rule = {
   id: string
@@ -69,31 +82,158 @@ type Rule = {
   test: (text: string) => boolean
 }
 
-const DATA_EXTENSION = /\.(?:csv|jsonl?|ya?ml|toml|ini|db|sqlite(?:3)?|sql|parquet|avro|xlsx?|docx?|pptx?|pdf|pem|key|crt|p12|env|bak|backup)\b/i
+const DATA_EXTENSION = /\.(?:csv|jsonl?|ya?ml|toml|ini|db|sqlite(?:3)?|sql|parquet|avro|xlsx?|docx?|pptx?|pdf|pem|key|p12|pfx|ppk|jks|keystore|kdbx|gpg|age|env|bak|backup)\b/i
+const CRITICAL_DATA_EXTENSION = /\.(?:pem|key|p12|pfx|ppk|jks|keystore|kdbx|gpg|age)\b/i
+const GENERAL_DATA_EXTENSION =
+  /\.(?:csv|jsonl?|ya?ml|toml|ini|db|sqlite(?:3)?|sql|parquet|avro|xlsx?|docx?|pptx?|pdf)(?=$|[\s"';&|)])/i
 const DELETE_PRIMITIVE =
-  /\b(?:rm|del|erase|rmdir|remove-item|clear-content|unlink|unlinkSync|rmSync|rmtree|os\.remove|os\.unlink|shutil\.rmtree)\b|(?:^|\s)-delete(?:\s|$)|\.unlink\s*\(/i
+  /\b(?:rm|ri|del|erase|rmdir|rd|remove-item|clear-content|unlink|unlinkSync|rmSync|rmtree|os\.remove|os\.unlink|shutil\.rmtree)\b|(?:^|\s)-delete(?:\s|$)|\.unlink\s*\(/i
 const WRAPPER_PRIMITIVE =
   /\b(?:eval|invoke-expression|iex)\b|(?:\b(?:bash|sh|zsh|cmd(?:\.exe)?|powershell|pwsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node)\b[^\n]{0,80}(?:\s-c|\s\/c|\s-command|\s-encodedcommand|\s-enc|\s-e))\b/i
 const SENSITIVE_ENV_FILE =
-  /(?:^|[\\/\s"'=])\.env(?!\.(?:example|sample|template|dist)(?=$|[\\/\s"';&|]))(?:\.[A-Za-z0-9_-]+)?(?=$|[\\/\s"';&|])/i
+  /(?:^|[\\/\s"'=])(?:\.env(?:\.[A-Za-z0-9_-]+)*|[A-Za-z0-9_.-]+\.env)(?=$|[\\/\s"';&|)])/i
 const BACKUP_SUFFIX_REFERENCE = /(?:\.backup|-backup|\.bak|-bak)\d*(?=$|[\\/\s"';&|])/m
+
+const FORCED_RECURSIVE_COMMANDS = ["remove-item", "ri", "rm", "del", "erase", "rmdir", "rd"]
+const CMD_STYLE_DELETE_COMMANDS = ["rmdir", "rd", "del", "erase"]
+const CMD_DELETE_FLAGS = /^\/[sfq]+$/i
+
+function forcedRecursiveShape(tokens: string[]) {
+  const command = commandLeaf(stripMatchingQuotes(tokens[0] ?? ""))
+  const flags = tokens
+    .slice(1)
+    .filter((token) => token.startsWith("-"))
+    .map((token) => token.toLowerCase())
+  const cmdFlags = CMD_STYLE_DELETE_COMMANDS.includes(command ?? "")
+    ? tokens
+        .slice(1)
+        .filter((token) => CMD_DELETE_FLAGS.test(token))
+        .map((token) => token.toLowerCase())
+    : []
+  const hasPowerShellPair =
+    FORCED_RECURSIVE_COMMANDS.includes(command ?? "") &&
+    flags.some((flag) => /^-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?$/.test(flag)) &&
+    flags.some((flag) => /^-f(?:o(?:r(?:c(?:e)?)?)?)?$/.test(flag))
+  const hasLongPair = flags.includes("--recursive") && flags.includes("--force")
+  const shortLetters = command === "rm"
+    ? flags.filter((flag) => /^-[dfirvR]+$/.test(flag)).join("")
+    : ""
+  const hasShortPair =
+    (/r/i.test(shortLetters) || flags.includes("--recursive")) &&
+    (/f/i.test(shortLetters) || flags.includes("--force"))
+  const cmdHasS = cmdFlags.some((flag) => flag.includes("s"))
+  const cmdHasQ = cmdFlags.some((flag) => flag.includes("q"))
+  const cmdHasF = cmdFlags.some((flag) => flag.includes("f"))
+  const hasCmdPair =
+    ((command === "rmdir" || command === "rd") && cmdHasS && cmdHasQ) ||
+    ((command === "del" || command === "erase") && cmdHasS && cmdHasQ && cmdHasF)
+  const forced = hasPowerShellPair || hasLongPair || hasShortPair || hasCmdPair
+
+  const targets: string[] = []
+  if (forced) {
+    for (let index = 1; index < tokens.length; index += 1) {
+      const token = tokens[index]
+      if (token === "--") continue
+      if (token.startsWith("-")) continue
+      if (CMD_STYLE_DELETE_COMMANDS.includes(command ?? "") && CMD_DELETE_FLAGS.test(token)) continue
+      if (isRedirectToken(token)) continue
+      if (/^(?:\d*|&)>{1,2}$/.test(token)) { index += 1; continue }
+      targets.push(token)
+    }
+  }
+  return { forced, targets }
+}
 
 function hasForcedRecursiveDelete(text: string) {
   const invocations =
-    text.match(/\b(?:remove-item|rm)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
+    text.match(/\b(?:remove-item|ri|rm|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
 
   return invocations.some((invocation) => {
     const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
     if (tokens.length < 2) return false
-
-    const flags = tokens.slice(1).filter((token) => token.startsWith("-")).map((token) => token.toLowerCase())
-    const hasPowerShellPair = flags.some((flag) => flag === "-recurse") && flags.some((flag) => flag === "-force")
-    const hasLongPair = flags.some((flag) => flag === "--recursive") && flags.some((flag) => flag === "--force")
-    const hasShortPair = flags.some((flag) => /^-[a-z]+$/i.test(flag) && flag.includes("r") && flag.includes("f"))
-    if (!hasPowerShellPair && !hasLongPair && !hasShortPair) return false
-
-    return tokens.slice(1).some((token) => token !== "--" && !token.startsWith("-"))
+    const shape = forcedRecursiveShape(tokens)
+    return shape.forced && shape.targets.length > 0
   })
+}
+
+function hasForcedRecursiveDeleteLiteralTarget(text: string): boolean {
+  const invocations =
+    text.match(/\b(?:remove-item|ri|rm|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
+
+  return invocations.some((invocation) => {
+    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    if (tokens.length < 2) return false
+    const shape = forcedRecursiveShape(tokens)
+    if (!shape.forced || shape.targets.length === 0) return false
+    return shape.targets.every((t) => literalPathToken(t) !== undefined)
+  })
+}
+
+function hasNamedTempPathSegment(target: string): boolean {
+  const cleaned = stripMatchingQuotes(target).replaceAll("\\", "/")
+  if (cleaned.split("/").some((segment) => segment === "..")) return false
+  return cleaned
+    .split("/")
+    .filter((segment) => segment.length > 0)
+    .some((segment) => {
+      const lower = segment.toLowerCase()
+      return lower === "temp" || lower === "tmp"
+    })
+}
+
+async function canonicalProjectedPath(candidate: string) {
+  let current = path.resolve(candidate)
+  const suffix: string[] = []
+  for (let index = 0; index < 128; index += 1) {
+    try {
+      const canonical = await realpath(current)
+      return suffix.length === 0 ? canonical : path.join(canonical, ...suffix.reverse())
+    } catch {
+      const parent = path.dirname(current)
+      if (parent === current) return undefined
+      suffix.push(path.basename(current))
+      current = parent
+    }
+  }
+  return undefined
+}
+
+async function isNamedTempTargetResolved(target: string, base: string | undefined) {
+  if (base === undefined) return false
+  const literal = literalPathToken(target)
+  if (!literal) return false
+  const cleaned = literal.replaceAll("\\", "/")
+  if (cleaned.split("/").some((segment) => segment === "..")) return false
+  const lexical = normalizeMsysPath(path.resolve(normalizeMsysPath(base), cleaned))
+  if (!hasNamedTempPathSegment(lexical)) return false
+  const canonical = await canonicalProjectedPath(lexical)
+  return Boolean(canonical && hasNamedTempPathSegment(canonical))
+}
+
+function isRedirectToken(token: string): boolean {
+  if (/^\d*>&\d+$/.test(token)) return true
+  if (/^(?:\d*|&)>{1,2}\S+$/.test(token)) return true
+  if (/^(?:\d*|&)>{1,2}$/.test(token)) return true
+  return false
+}
+
+function hasHostShutdownCommand(text: string): boolean {
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith("#")) continue
+    let stripped = trimmed.replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*/, "")
+    stripped = stripped.replace(/^(?:sudo\s+|runas\s+)/i, "")
+    const firstToken = stripped.match(/^(\S+)/)?.[1] ?? ""
+    const command = firstToken.replace(/\.(?:exe|cmd|bat|ps1)$/i, "").toLowerCase()
+    if (["shutdown", "reboot", "poweroff", "halt"].includes(command)) return true
+    if (/^stop-computer\b/i.test(stripped)) return true
+  }
+  return false
+}
+
+function hasDeletePrimitive(text: string): boolean {
+  const stripped = text.replace(/'[^']*'/g, "").replace(/"(?:[^"]|"")*"/g, "")
+  return DELETE_PRIMITIVE.test(stripped)
 }
 
 const SECURITY_SIGNAL_RULES: Rule[] = [
@@ -110,7 +250,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   {
     id: "filesystem.forced-recursive-delete",
     reason: "Force-recursive directory deletion",
-    test: hasForcedRecursiveDelete,
+    test: hasForcedRecursiveDeleteLiteralTarget,
   },
   {
     id: "filesystem.root-delete",
@@ -154,7 +294,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   {
     id: "system.shutdown",
     reason: "Attempts to shut down or reboot the host",
-    test: (text) => /\b(?:shutdown|reboot|poweroff|halt)\b/i.test(text) || /\bstop-computer\b/i.test(text),
+    test: hasHostShutdownCommand,
   },
   {
     id: "system.critical-process-kill",
@@ -407,8 +547,14 @@ function parseDeleteInvocation(segment: string): ParsedDeleteInvocation | undefi
       continue
     }
     if (/^\d*>&\d+$/.test(token)) continue
+    if (/^(?:\d*|&)>{1,2}\S+$/.test(token)) continue
+    if (/^(?:\d*|&)>{1,2}$/.test(token)) {
+      if (index + 1 < tokens.length) index += 1
+      continue
+    }
     if (!optionsEnded && (optionsWithoutValues.has(token) || optionsWithoutValues.has(lower))) continue
     if (!optionsEnded && /^-[firdvR]+$/.test(token)) continue
+    if (!optionsEnded && CMD_STYLE_DELETE_COMMANDS.includes(command ?? "") && CMD_DELETE_FLAGS.test(token)) continue
     if (!optionsEnded && token.startsWith("-")) return { parseable: false, targets }
     targets.push(token)
   }
@@ -634,7 +780,19 @@ async function isTrustedTempPath(
 
 function isHarmlessTailSegment(segment: string) {
   const value = segment.trim()
-  return /^(?:echo|printf|Write-Output|true|false|:|cd|popd)\b/i.test(value) && !/[<>]/.test(value)
+  if (/[<>]/.test(value)) return false
+  if (/^(?:echo|printf|Write-Output|true|false|:|cd|popd)\b/i.test(value)) return true
+  if (/^set\b/i.test(value)) {
+    const tokens = value.split(/\s+/).slice(1)
+    const safeOptions = new Set([
+      "pipefail", "errexit", "nounset", "xtrace", "verbose",
+      "noclobber", "ignoreeof", "allexport", "nolog", "privileged",
+    ])
+    if (tokens.every((t) => /^[-+][a-zA-Z]+$/.test(t) || safeOptions.has(t.toLowerCase()) || t === "--" || t === "-")) {
+      return true
+    }
+  }
+  return false
 }
 
 async function classifyUserLocalTempSegment(
@@ -652,12 +810,14 @@ async function classifyUserLocalTempSegment(
   const payloadShell = wrappedPowerShell
     ? "powershell"
     : wrappedNamedShell?.shell ?? input.shell
-  const segments = splitSimpleSegments(payload, payloadShell)
+  const segments = splitCommandSegments(payload, payloadShell)
   if (!segments?.length) return undefined
 
   let base: string | undefined = input.cwd
   let operations = 0
-  for (const segment of segments) {
+  for (const item of segments) {
+    base = segmentBase(item, base, input.cwd)
+    const segment = item.text
     const cd = parseCdSegment(segment)
     if (cd) {
       base = resolveCdBase(cd.dir, base)
@@ -672,6 +832,14 @@ async function classifyUserLocalTempSegment(
         if (!(await isTrustedTempPath(target, base, roots))) return undefined
       }
       operations += 1
+      if (input.strictness === "HARD") {
+        return {
+          verdict: "DENY",
+          rules: ["hard.local-temp-delete"],
+          reason: `Permanent deletion inside the trusted Local Temp directory is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+          fingerprints: [],
+        }
+      }
       continue
     }
 
@@ -702,6 +870,7 @@ async function classifyUserLocalTempSegment(
   }
 
   if (operations === 0) return undefined
+  if (input.strictness === "HARD") return undefined
   return {
     verdict: "ALLOW",
     rules: ["cleanup.user-local-temp"],
@@ -720,7 +889,19 @@ function unwrapNamedTempDeletionShell(
   const tokens = simpleInvocationTokens(value)
   let commandIndex = 0
   if (commandLeaf(tokens[0] ?? "") === "wsl") {
-    commandIndex = tokens[1] === "--" ? 2 : 1
+    commandIndex = 1
+    while (commandIndex < tokens.length) {
+      const lower = tokens[commandIndex].toLowerCase()
+      if (lower === "-d" || lower === "--distribution" || lower === "-u" || lower === "--user") {
+        commandIndex += 2
+        continue
+      }
+      if (lower === "--") {
+        commandIndex += 1
+        break
+      }
+      break
+    }
   }
 
   const wrapper = commandLeaf(tokens[commandIndex] ?? "")
@@ -788,10 +969,10 @@ function decodedPowerShellDeletionPayloads(source: string, shell: string) {
   return decodePowerShellBase64(stripMatchingQuotes(encoded))
 }
 
-function classifyNamedTempDeletionPolicy(
+async function classifyNamedTempDeletionPolicy(
   source: string,
   input: ClassifyShellCommandInput,
-): StaticSecurityDecision | undefined {
+): Promise<StaticSecurityDecision | undefined> {
   const candidates = [
     namedTempDeletionPayload(source, input),
     ...decodedPowerShellDeletionPayloads(source, input.shell).map((payload) => ({
@@ -802,35 +983,54 @@ function classifyNamedTempDeletionPolicy(
   const rootDeleteRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.root-delete")
 
   for (const { payload, payloadShell } of candidates) {
-    const segments = splitSimpleSegments(payload, payloadShell)
+    const segments = splitCommandSegments(payload, payloadShell)
     if (!segments?.length || rootDeleteRule?.test(payload)) continue
 
     let hasNamedTempTarget = false
     let pureDeletion = true
-    for (const segment of segments) {
-      if (parseCdSegment(segment)) continue
-      const tokens = simpleInvocationTokens(segment.trim())
+    let base = input.cwd
+    for (const item of segments) {
+      base = segmentBase(item, base, input.cwd)
+      const segment = item.text
+      const cd = parseCdSegment(segment)
+      if (cd) {
+        base = resolveCdBase(cd.dir, base)
+        continue
+      }
+      const stripped = stripHarmlessPrefixes(segment)
+      const tokens = simpleInvocationTokens(stripped.trim())
       const command = commandLeaf(tokens[0] ?? "")
       if (!DELETE_COMMANDS.has(command ?? "")) {
+        if (isHarmlessTailSegment(stripped)) continue
         pureDeletion = false
         break
       }
 
-      const deletion = parseDeleteInvocation(segment)
+      const deletion = parseDeleteInvocation(stripped)
       if (!deletion?.parseable || deletion.targets.length === 0) {
         pureDeletion = false
         break
       }
-      if (deletion.targets.some((target) => /tmp|temp/i.test(stripMatchingQuotes(target)))) {
-        hasNamedTempTarget = true
+      if (base === undefined || !(await deletionTargetsAreNamedTemp(deletion.targets, base))) {
+        pureDeletion = false
+        break
       }
+      hasNamedTempTarget = true
     }
 
     if (pureDeletion && hasNamedTempTarget) {
+      if (input.strictness === "HARD") {
+        return {
+          verdict: "DENY",
+          rules: ["hard.named-temp-delete"],
+          reason: `Permanent deletion of named temp/tmp targets is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+          fingerprints: [],
+        }
+      }
       return {
         verdict: "ALLOW",
         rules: ["cleanup.named-temp"],
-        reason: "Pure deletion includes a target containing tmp or temp",
+        reason: "Every deletion target is confined to a named temp or tmp directory",
         fingerprints: [],
       }
     }
@@ -839,10 +1039,18 @@ function classifyNamedTempDeletionPolicy(
   return undefined
 }
 
+async function deletionTargetsAreNamedTemp(targets: string[], base: string) {
+  for (const target of targets) {
+    if (!(await isNamedTempTargetResolved(target, base))) return false
+  }
+  return true
+}
+
 function hasExplicitNonCopyBackupCreation(segment: string) {
   const value = segment.trim()
   if (!BACKUP_SUFFIX_REFERENCE.test(value)) return false
-  if (/^(?:touch|mkdir|new-item|set-content|out-file|tee|install)\b/i.test(value)) return true
+  if (/^(?:mkdir|New-Item\s+[^\n]*-ItemType\s+Directory)\b/i.test(value)) return false
+  if (/^(?:touch|new-item|set-content|out-file|tee|install)\b/i.test(value)) return true
   if (
     /^tar\b[^\r\n;&|]*(?:-[A-Za-z]*f\s+|--file(?:=|\s+))(?:"[^"]*(?:\.backup|-backup|\.bak|-bak)\d*"|'[^']*(?:\.backup|-backup|\.bak|-bak)\d*'|[^\s;&|]*(?:\.backup|-backup|\.bak|-bak)\d*)(?:\s|$)/i.test(
       value,
@@ -1039,6 +1247,14 @@ async function classifyBackupPolicy(
       }
     }
   }
+  if (input.strictness === "HARD") {
+    return {
+      verdict: "DENY",
+      rules: ["hard.backup-delete"],
+      reason: `Permanent deletion of backup targets is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+      fingerprints: [],
+    }
+  }
   return {
     verdict: "ALLOW",
     rules: ["filesystem.backup-delete"],
@@ -1116,15 +1332,39 @@ const DELETE_COMMANDS = new Set([
   "ri",
 ])
 
-function parseCdSegment(text: string): { dir: string } | undefined {
-  const match = text.trim().match(/^\(?\s*(?:cd|pushd|set-location)\s+(.+)$/i)
-  if (!match) return undefined
-  const target = match[1].trim()
-  if (/\$\{|`|\$\(|[\n;&|]/.test(target)) return undefined
-  return { dir: stripMatchingQuotes(target) }
+function isFullyQuoted(value: string) {
+  const trimmed = value.trim()
+  if (trimmed.length < 2) return false
+  const first = trimmed[0]
+  const last = trimmed[trimmed.length - 1]
+  return (first === '"' || first === "'") && first === last
 }
 
-function resolveCdBase(dir: string, base: string | undefined) {
+function isDynamicCdTarget(rawTarget: string, target: string) {
+  if (target === "-" || /^~[-+]/.test(target)) return true
+  if (/[\n;&|]/.test(rawTarget)) return true
+  if (/\$\{|`|\$\(|\$[A-Za-z_]|%/.test(target)) return true
+  if (!isFullyQuoted(rawTarget) && /\s/.test(target)) return true
+  return false
+}
+
+function parseCdSegment(text: string): { dir: string | undefined } | undefined {
+  const trimmed = text.trim()
+  if (/^\(?\s*(?:cd|pushd|popd|set-location)\s*\)?$/i.test(trimmed)) {
+    return { dir: undefined }
+  }
+  if (/^\(?\s*(?:popd\b|cd\.\.\s*\)?$)/i.test(trimmed)) {
+    return { dir: undefined }
+  }
+  const match = trimmed.match(/^\(?\s*(?:cd|pushd|set-location)\s+(.+)$/i)
+  if (!match) return undefined
+  const rawTarget = match[1].trim()
+  const target = stripMatchingQuotes(rawTarget)
+  return { dir: isDynamicCdTarget(rawTarget, target) ? undefined : target }
+}
+
+function resolveCdBase(dir: string | undefined, base: string | undefined) {
+  if (dir === undefined) return undefined
   const expanded = expandHome(dir)
   if (!expanded || /[*?[\]`$%{}]/.test(expanded) || /[<>|]/.test(expanded)) return undefined
   return path.isAbsolute(expanded) ? path.normalize(expanded) : base ? path.resolve(base, expanded) : undefined
@@ -1145,6 +1385,14 @@ function isExplicitDisposableCleanup(script: string) {
     ),
   ]
   if (patterns.some((pattern) => pattern.test(value))) return true
+
+  const rmMultiMatch = value.match(/^rm\s+-[a-z]*[rf][a-z]*\s+(.+)$/i)
+  if (rmMultiMatch) {
+    const targets = rmMultiMatch[1].trim().split(/\s+/)
+    const disposablePattern =
+      /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__)[\\/]?$/i
+    if (targets.length > 0 && targets.every((t) => disposablePattern.test(t))) return true
+  }
 
   const invocation = value.match(/^(?:remove-item|rm)\s+(.+)$/i)
   if (!invocation) return false
@@ -1189,23 +1437,94 @@ function shellSupportsSingleQuotes(shell: string) {
   return path.basename(shell).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase() !== "cmd"
 }
 
-function splitSimpleSegments(script: string, shell: string) {
+function stripTimeoutPrefix(segment: string): string | undefined {
+  const tokens = simpleInvocationTokens(segment.trim())
+  if (commandLeaf(tokens[0] ?? "") !== "timeout") return segment
+  let index = 1
+  while (index < tokens.length) {
+    const lower = tokens[index].toLowerCase()
+    if (lower === "--" || !lower.startsWith("-")) break
+    if (lower === "-k" || lower === "--kill-after" || lower === "-s" || lower === "--signal") {
+      index += 2
+      continue
+    }
+    index += 1
+  }
+  if (index >= tokens.length) return undefined
+  index += 1
+  if (index >= tokens.length) return undefined
+  return tokens.slice(index).join(" ")
+}
+
+function stripHarmlessPrefixes(segment: string): string {
+  let result = segment.trim()
+  for (let depth = 0; depth < 3; depth += 1) {
+    const subshell = result.match(/^\(([\s\S]+)\)$/)
+    if (subshell) {
+      result = subshell[1].trim()
+      continue
+    }
+    const timeoutStripped = stripTimeoutPrefix(result)
+    if (timeoutStripped && timeoutStripped !== result) {
+      result = timeoutStripped
+      continue
+    }
+    break
+  }
+  return result
+}
+
+function maskHeredocBody(text: string): string {
+  const match = text.match(/<<-?\s*(?:'([^']+)'|"([^"]+)"|(\w+))/)
+  if (!match) return text
+  const delimiter = match[1] ?? match[2] ?? match[3]
+  if (!delimiter) return text
+  const bodyStart = (match.index ?? 0) + match[0].length
+  const lineEnd = text.indexOf("\n", bodyStart)
+  if (lineEnd < 0) return text
+  const escapedDelim = delimiter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  const closingRegex = new RegExp(`^\\s*${escapedDelim}\\s*$`, "m")
+  const bodyContent = text.slice(lineEnd + 1)
+  const closingMatch = bodyContent.match(closingRegex)
+  if (!closingMatch) return text
+  const bodyEnd = lineEnd + 1 + (closingMatch.index ?? 0) + closingMatch[0].length
+  return text.slice(0, lineEnd + 1) + "[heredoc-body]" + text.slice(bodyEnd)
+}
+
+type SegmentConnector = "&&" | "||" | ";" | "newline" | "|" | "&"
+type CommandSegment = { text: string; incoming?: SegmentConnector }
+
+function splitCommandSegments(script: string, shell: string) {
   const value = script.trim()
   const escapeCharacter = shellEscapeCharacter(shell)
   const supportsSingleQuotes = shellSupportsSingleQuotes(shell)
-  const segments: string[] = []
+  const segments: CommandSegment[] = []
   let current = ""
   let quote: "'" | '"' | undefined
   let escaped = false
+  let heredocDelim: string | undefined
+  let incoming: SegmentConnector | undefined
 
-  const push = () => {
+  const push = (next?: SegmentConnector) => {
     const segment = current.trim()
-    if (segment) segments.push(segment)
+    if (segment) segments.push({ text: segment, incoming })
     current = ""
+    incoming = next
   }
 
   for (let index = 0; index < value.length; index += 1) {
     const character = value[index]
+
+    if (heredocDelim !== undefined) {
+      current += character
+      if (character === "\n") {
+        let lineStart = current.length - 1
+        while (lineStart > 0 && current[lineStart - 1] !== "\n") lineStart--
+        const line = current.slice(lineStart, current.length - 1).trim()
+        if (line === heredocDelim) heredocDelim = undefined
+      }
+      continue
+    }
 
     if (escaped) {
       current += character
@@ -1228,39 +1547,106 @@ function splitSimpleSegments(script: string, shell: string) {
       continue
     }
     if (character === "`" && escapeCharacter !== "`") return undefined
+
+    if (character === "<" && value[index + 1] === "<") {
+      let lookAhead = index + 2
+      if (value[lookAhead] === "-") lookAhead += 1
+      while (lookAhead < value.length && (value[lookAhead] === " " || value[lookAhead] === "\t")) lookAhead += 1
+      let delim = ""
+      let delimEnd = lookAhead
+      if (value[lookAhead] === "'" || value[lookAhead] === '"') {
+        const dq = value[lookAhead]
+        delimEnd = lookAhead + 1
+        while (delimEnd < value.length && value[delimEnd] !== dq) {
+          delim += value[delimEnd]
+          delimEnd += 1
+        }
+        delimEnd += 1
+      } else {
+        while (delimEnd < value.length && /\w/.test(value[delimEnd])) {
+          delim += value[delimEnd]
+          delimEnd += 1
+        }
+      }
+      if (delim) {
+        current += value.slice(index, delimEnd)
+        index = delimEnd - 1
+        heredocDelim = delim
+        continue
+      }
+    }
+
     if (character === ";" || character === "\n" || character === "\r") {
       if (character === "\r" && value[index + 1] === "\n") index += 1
-      push()
+      push(character === ";" ? ";" : "newline")
       continue
     }
     if ((character === "&" || character === "|") && value[index + 1] === character) {
       index += 1
-      push()
+      push(character === "&" ? "&&" : "||")
       continue
     }
     if (character === "&" && /(?:^|\s)\d*>\s*$/.test(current) && /^\d$/.test(value[index + 1] ?? "")) {
       current += character
       continue
     }
+    if (character === "&" && value[index + 1] === ">") {
+      current += character
+      continue
+    }
     if (character === "|" || character === "&") {
-      push()
+      push(character as "|" | "&")
       continue
     }
     current += character
   }
 
   if (quote || escaped) return undefined
+  if (heredocDelim !== undefined) {
+    const lastLine = current.split("\n").at(-1)?.trim()
+    if (lastLine !== heredocDelim) return undefined
+  }
   push()
   return segments
 }
 
+function splitSimpleSegments(script: string, shell: string) {
+  return splitCommandSegments(script, shell)?.map((segment) => segment.text)
+}
+
+function segmentBase(segment: CommandSegment, current: string | undefined, original: string) {
+  return segment.incoming === "&&" ? current : original
+}
+
+function normalizeCommandInSegment(segment: string): string {
+  const callMatch = segment.match(/^&\s+(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+([\s\S]*))?$/)
+  if (callMatch) {
+    const exePath = callMatch[1] ?? callMatch[2] ?? callMatch[3] ?? ""
+    const leaf = commandLeaf(exePath)
+    const rest = callMatch[4] ?? ""
+    return rest ? `${leaf} ${rest}` : leaf
+  }
+  const firstTokenMatch = segment.match(/^(\S+)/)
+  if (firstTokenMatch) {
+    const firstToken = firstTokenMatch[1]
+    const leaf = commandLeaf(firstToken)
+    return leaf + segment.slice(firstToken.length)
+  }
+  return segment
+}
+
 function isKnownSafeSegment(segment: string) {
-  const value = segment
-    .replace(/(?:\s+\d*>&\d+)+\s*$/, "")
-    .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*/, "")
-    .trim()
+  const value = normalizeCommandInSegment(
+    segment
+      .replace(/(?:\s+\d*>&\d+)+\s*$/, "")
+      .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*/, "")
+      .trim(),
+  )
   if (!value) return true
-  if (/[<>](?![=])/.test(value)) return false
+  const harmlessValue = value
+    .replace(/>\s*\/dev\/(?:null|stdout|stderr)\b/gi, "")
+    .replace(/>\s*\$null\b/gi, "")
+  if (/[<>](?![=])/.test(harmlessValue)) return false
   if (/^(?:true|false|:)\b/i.test(value)) return true
 
   if (
@@ -1270,12 +1656,34 @@ function isKnownSafeSegment(segment: string) {
   ) {
     return true
   }
+  if (/^(?:tasklist|Get-Process|netstat|ss)\b/i.test(value)) return true
+  if (/^docker\s+(?:ps|images)\b/i.test(value)) return true
+  if (/^(?:Get-Command|Select-Object|Write-Host|findstr|iconv)\b/i.test(value)) return true
+  if (/^base64\b/i.test(value) && !/\b(?:bash|sh|zsh|python|node|powershell|pwsh|eval)\b/i.test(value)) return true
+  if (/^schtasks\b/i.test(value)) {
+    return /\/Query\b/i.test(value) && !/\/(?:Create|Delete|Change|Run|End)\b/i.test(value)
+  }
+  if (/^wsl(?:\.exe)?\b/i.test(value)) {
+    return /\s--(?:help|status|list|verbose)\b/i.test(value) && !/\s--(?:shutdown|terminate)\b/i.test(value)
+  }
+  if (/^(?:jq|diff)\b/i.test(value)) return true
+  if (/^set\b/i.test(value)) {
+    const tokens = value.split(/\s+/).slice(1)
+    const safeOptions = new Set([
+      "pipefail", "errexit", "nounset", "xtrace", "verbose",
+      "noclobber", "ignoreeof", "allexport", "nolog", "privileged",
+    ])
+    if (tokens.every((t) => /^[-+][a-zA-Z]+$/.test(t) || safeOptions.has(t.toLowerCase()) || t === "--" || t === "-")) {
+      return true
+    }
+  }
   if (/^(?:cat|type|more|less)\b/i.test(value)) {
     return !hasSensitiveCredentialReference(value) && !/\b(?:credential|token|secret|password|private)\b/i.test(value)
   }
   if (/^(?:rg|grep|Select-String)\b/i.test(value)) return true
   if (/^find\b/i.test(value)) return !/(?:^|\s)-(?:delete|exec|execdir|ok|okdir)(?:\s|$)/i.test(value)
   if (/^git\s+(?:status|diff|log|show|rev-parse|ls-files|grep|remote\s+-v|add|commit)\b/i.test(value)) return true
+  if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+)\b/i.test(value)) return true
   if (/^(?:mkdir|New-Item\s+[^\n]*-ItemType\s+Directory)\b/i.test(value)) return true
   if (/^(?:tar\s+-[a-z]*c[a-z]*f|zip\s+-r)\b/i.test(value)) return !/--remove-files\b/i.test(value)
   if (/^(?:cp|copy|Copy-Item)\b/i.test(value)) return false
@@ -1294,6 +1702,14 @@ function isKnownSafeSegment(segment: string) {
     return true
   }
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|format|check|build))\b/i.test(value)) return true
+  if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|ci)\b/i.test(value)) return true
+  if (/^(?:pip(?:3)?|pipx|uv)\s+(?:install|add)\b/i.test(value)) return true
+  if (/^cargo\s+(?:add|fetch|update)\b/i.test(value)) return true
+  if (/^go\s+(?:get|mod\s+download)\b/i.test(value)) return true
+  if (/^dotnet\s+(?:restore|build)\b/i.test(value)) return true
+  if (/^(?:cargo\s+build|go\s+build|cmake\s+--build|ninja|vite\s+build|next\s+build|nuxt\s+build|svelte-kit\s+build|webpack|rollup|esbuild|tsc)\b/i.test(value)) return true
+  if (/^make\b/i.test(value) && !/\bclean\b/i.test(value)) return true
+  if (/^(?:mvnw?|maven|gradlew?)\s+(?:build|package|compile|install|verify|assemble|bundle|jar|compileJava|deploy)\b/i.test(value) && !/\bclean\b/i.test(value)) return true
   return false
 }
 
@@ -1341,14 +1757,15 @@ function recycleCommandInvocation(segment: string) {
     .match(/^(?:&\s+)?(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+([\s\S]*))?$/)
   if (!match) return undefined
 
-  const executable = (match[1] ?? match[2] ?? match[3] ?? "")
+  const rawExecutable = match[1] ?? match[2] ?? match[3] ?? ""
+  const executable = rawExecutable
     .replaceAll("\\", "/")
     .split("/")
     .at(-1)
     ?.replace(/\.(?:exe|cmd|bat|ps1)$/i, "")
     .toLowerCase()
   if (!executable) return undefined
-  return { executable, args: (match[4] ?? "").trim() }
+  return { executable, rawExecutable, args: (match[4] ?? "").trim() }
 }
 
 function hasPermanentTrashOperation(args: string) {
@@ -1361,7 +1778,7 @@ function isPowerShellRecycleSetup(segment: string) {
   )
 }
 
-function isPowerShellRecycleAction(segment: string) {
+function powerShellRecycleTarget(segment: string) {
   const value = segment.trim()
   const visualBasic = value.match(
     /^\[Microsoft\.VisualBasic\.FileIO\.FileSystem\]::Delete(?:File|Directory)\s*\(\s*(?:"[^"]*"|'[^']*'|\$[A-Za-z_][A-Za-z0-9_:]*)\s*,([\s\S]*)\)\s*$/i,
@@ -1371,60 +1788,111 @@ function isPowerShellRecycleAction(segment: string) {
     /\bSendToRecycleBin\b/i.test(visualBasic[1]) &&
     /^[\s,'"\[\].:A-Za-z0-9_-]+$/.test(visualBasic[1])
   ) {
-    return true
+    return value.match(/Delete(?:File|Directory)\s*\(\s*("[^"]*"|'[^']*'|\$[A-Za-z_][A-Za-z0-9_:]*)/i)?.[1]
   }
 
-  return /^\(\s*New-Object\s+-ComObject\s+Shell\.Application\s*\)\.Namespace\s*\(\s*(?:10|0xA)\s*\)\.MoveHere\s*\(\s*(?:"[^"]*"|'[^']*'|\$[A-Za-z_][A-Za-z0-9_:]*)\s*(?:,\s*\d+\s*)?\)\s*$/i.test(
-    value,
+  const shellTarget = value.match(
+    /^\(\s*New-Object\s+-ComObject\s+Shell\.Application\s*\)\.Namespace\s*\(\s*(?:10|0xA)\s*\)\.MoveHere\s*\(\s*("[^"]*"|'[^']*'|\$[A-Za-z_][A-Za-z0-9_:]*)\s*(?:,\s*\d+\s*)?\)\s*$/i,
   )
+  return shellTarget?.[1]
 }
 
-function isRecycleCliAction(segment: string) {
+function recycleCliTargets(segment: string) {
   if (/[<>]/.test(segment) || /\$\(|`[^`\r\n]+`/.test(segment)) return false
   const invocation = recycleCommandInvocation(segment)
   if (!invocation) return false
-  const { executable, args } = invocation
+  const { executable, rawExecutable, args } = invocation
+  if (/[\\/]/.test(rawExecutable)) return undefined
+  const tokens = simpleInvocationTokens(args)
 
   if (["trash", "recycle", "recycle-bin"].includes(executable)) {
-    return !hasPermanentTrashOperation(args)
+    return hasPermanentTrashOperation(args) ? undefined : tokens.filter((token) => !token.startsWith("-"))
   }
-  if (["trash-put", "gvfs-trash", "send2trash"].includes(executable)) return true
-  if (executable === "gio") return /^trash\b(?![\s\S]*\s--empty(?:\s|$))/i.test(args)
-  if (/^kioclient(?:5|6)?$/.test(executable)) return /^move\b[\s\S]+\strash:\/?\s*$/i.test(args)
-  if (["python", "python3", "py"].includes(executable)) {
-    return /^-m\s+send2trash\b/i.test(args)
+  if (["trash-put", "gvfs-trash", "send2trash"].includes(executable)) {
+    return tokens.filter((token) => !token.startsWith("-"))
   }
-  return false
+  if (executable === "gio" && /^trash\b/i.test(args) && !hasPermanentTrashOperation(args)) {
+    return tokens.slice(1).filter((token) => !token.startsWith("-"))
+  }
+  if (/^kioclient(?:5|6)?$/.test(executable) && /^move\b[\s\S]+\strash:\/?\s*$/i.test(args)) {
+    return tokens.length >= 3 ? [tokens[1]] : []
+  }
+  return undefined
 }
 
-function isExplicitRecycleBinOperation(script: string, shell: string) {
+function explicitRecycleBinOperation(script: string, shell: string) {
   const wrappedPowerShell = unwrapPowerShellCommand(script)
   const payload = wrappedPowerShell ?? script
   const payloadShell = wrappedPowerShell ? "powershell" : shell
   const segments = splitSimpleSegments(payload, payloadShell)
-  if (!segments?.length) return false
+  if (!segments?.length) return undefined
 
   let recycleActions = 0
+  const targets: string[] = []
   for (const segment of segments) {
     if (isPowerShellRecycleSetup(segment)) continue
-    if (isPowerShellRecycleAction(segment) || isRecycleCliAction(segment)) {
+    const powerShellTarget = powerShellRecycleTarget(segment)
+    const cliTargets = recycleCliTargets(segment)
+    if (powerShellTarget || cliTargets) {
       recycleActions += 1
+      if (powerShellTarget) targets.push(powerShellTarget)
+      if (cliTargets) targets.push(...cliTargets)
       continue
     }
-    return false
+    return undefined
   }
-  return recycleActions > 0
+  return recycleActions > 0 && targets.length > 0 ? { targets } : undefined
 }
 
-function hasDataDestruction(text: string) {
-  if (!DELETE_PRIMITIVE.test(text)) return false
-  if (DATA_EXTENSION.test(text)) return true
+function hasForbiddenRecycleDestruction(text: string) {
+  if (/\bclear-recyclebin\b/i.test(text)) return true
+  if (/\b(?:trash-empty|trash-rm)\b/i.test(text)) return true
+  if (/\btrash\b[^\r\n;&|]*(?:--empty|--purge)\b/i.test(text)) return true
+  if (/\bgio\s+trash\b[^\r\n;&|]*--empty\b/i.test(text)) return true
+  return (
+    hasDeletePrimitive(text) &&
+    /(?:\$Recycle\.Bin(?:[\\/]|\b)|~[\\/]\.local[\\/]share[\\/]Trash[\\/]files(?:[\\/]|\b)|trash:\/\/)/i.test(text)
+  )
+}
+
+function hasDataPathDestruction(text: string) {
   return (
     /(?:\b(?:shutil\.rmtree|os\.(?:remove|unlink))\b|\bfs(?:\.promises)?\.(?:rm|unlink)(?:Sync)?\s*\(|\brequire\s*\(\s*["'](?:node:)?fs["']\s*\)\.(?:rm|unlink)(?:Sync)?\s*\(|\.(?:rm|unlink)(?:Sync)?\s*\()/i.test(
       text,
     ) &&
     /(?:\/data\b|\/var\/data\b|\/project\b|\/production\b|\\data\\|\\project\\|\\production\\)/i.test(text)
   )
+}
+
+function hasCriticalDataDestruction(text: string) {
+  if (!hasDeletePrimitive(text)) return false
+  return (
+    CRITICAL_DATA_EXTENSION.test(text) ||
+    SENSITIVE_ENV_FILE.test(text) ||
+    /(?:^|[\\/\s"'])id_(?:rsa|dsa|ecdsa|ed25519)(?=$|[\\/\s"';&|)])/i.test(text) ||
+    /(?:^|[\\/\s"'])(?:\.ssh|\.gnupg)(?=$|[\\/\s"';&|)])/i.test(text)
+  )
+}
+
+function hasGeneralDataDestruction(text: string) {
+  if (!hasDeletePrimitive(text)) return false
+  return GENERAL_DATA_EXTENSION.test(text) || hasDataPathDestruction(text)
+}
+
+function isCriticalDeletionTarget(target: string) {
+  const literal = literalPathToken(target)
+  return Boolean(literal && isCriticalOriginalPath(literal))
+}
+
+function isGeneralDataTarget(target: string) {
+  const literal = literalPathToken(target)
+  return Boolean(literal && GENERAL_DATA_EXTENSION.test(literal))
+}
+
+function hasDataDestruction(text: string) {
+  if (!hasDeletePrimitive(text)) return false
+  if (DATA_EXTENSION.test(text)) return true
+  return hasDataPathDestruction(text)
 }
 
 function hasDestructiveOpenOverwrite(text: string) {
@@ -1448,6 +1916,34 @@ function hasDestructiveOverwrite(text: string) {
   )
 }
 
+function hasFileWritePrimitive(text: string): boolean {
+  if (/\btee\b/i.test(text)) return true
+  if (/\btouch\b/i.test(text)) return true
+  if (/\bmkdir\b/i.test(text)) return true
+  if (/\b(?:cp|copy|copy-item)\b/i.test(text)) return true
+  if (/\b(?:mv|move|move-item|rename-item|ren)\b/i.test(text)) return true
+  if (/\bsed\b[^\n]*-i\b/i.test(text)) return true
+  if (/\b(?:set-content|out-file)\b/i.test(text)) return true
+  if (/\bnew-item\b/i.test(text)) return true
+  if (/open\s*\([^)]*['"][wax]/i.test(text)) return true
+  if (/\.write_text\s*\(/i.test(text) || /\.write_bytes\s*\(/i.test(text)) return true
+  if (/\b(?:writeFile|writeFileSync|appendFile|appendFileSync|copyFile|copyFileSync)\s*\(/i.test(text)) return true
+  if (/\bcreateWriteStream\s*\(/i.test(text)) return true
+  const redirectCleaned = text
+    .replace(/>\s*\/dev\/(?:null|stdout|stderr)\b/gi, "")
+    .replace(/>\s*\$null\b/gi, "")
+    .replace(/\d*>&\d+/g, "")
+  if (/(?:^|[^=>])>(?![=>])/m.test(redirectCleaned)) return true
+  return false
+}
+
+function hasLocalScriptReviewSignal(text: string): boolean {
+  if (hasDeletePrimitive(text)) return true
+  if (/\b(?:kill|pkill|killall|taskkill|stop-process)\b/i.test(text)) return true
+  if (hasFileWritePrimitive(text)) return true
+  return false
+}
+
 function stripMatchingQuotes(value: string) {
   if (value.length < 2) return value
   const first = value[0]
@@ -1455,56 +1951,94 @@ function stripMatchingQuotes(value: string) {
   return (first === '"' || first === "'") && first === last ? value.slice(1, -1) : value
 }
 
-function deletionTargetCandidates(script: string) {
-  if (!DELETE_PRIMITIVE.test(script)) return []
+type DeletionTargetCandidate = { target: string; cwd: string }
 
-  const candidates = new Set<string>()
-  const invocations =
-    script.match(/\b(?:remove-item|rm|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
-  const optionsWithValues = new Set([
-    "-filter",
-    "-include",
-    "-exclude",
-    "-erroraction",
-    "-warningaction",
-    "-informationaction",
-    "-errorvariable",
-    "-warningvariable",
-    "-outvariable",
-    "-outbuffer",
-    "-pipelinevariable",
-  ])
+function deletionTargetCandidates(script: string, shell: string, cwd: string) {
+  const items: DeletionTargetCandidate[] = []
+  const seen = new Set<string>()
+  let truncated = false
+  const surfaces = [script, ...extractQuotedWrappers(script)]
 
-  for (const invocation of invocations) {
-    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
-    const command = tokens[0]?.toLowerCase()
-    let optionsEnded = false
-    for (let index = 1; index < tokens.length; index += 1) {
-      const token = tokens[index]
-      const lower = token.toLowerCase()
-      if (lower === "--") {
-        optionsEnded = true
+  const add = (target: string, base: string) => {
+    const cleaned = stripMatchingQuotes(target)
+    const key = `${path.resolve(base)}\0${cleaned}`
+    if (seen.has(key)) return
+    seen.add(key)
+    if (items.length >= MAX_TARGET_DIRECTORIES) {
+      truncated = true
+      return
+    }
+    items.push({ target: cleaned, cwd: base })
+  }
+
+  for (const surface of surfaces) {
+    const segments = splitCommandSegments(surface, shell) ?? [{ text: surface }]
+    let base: string | undefined = cwd
+    for (const item of segments) {
+      base = segmentBase(item, base, cwd)
+      const segment = stripHarmlessPrefixes(item.text)
+      const cd = parseCdSegment(segment)
+      if (cd) {
+        base = resolveCdBase(cd.dir, base)
         continue
       }
-      if (!optionsEnded && (lower === "-path" || lower === "-literalpath")) {
-        const target = tokens[index + 1]
-        if (target) {
-          candidates.add(stripMatchingQuotes(target))
-          index += 1
-        }
-        continue
+      if (!base) continue
+      const deletion = parseDeleteInvocation(segment)
+      if (deletion?.parseable) {
+        for (const target of deletion.targets) add(target, base)
       }
-      if (!optionsEnded && optionsWithValues.has(lower)) {
-        index += 1
-        continue
+      const recycle = explicitRecycleBinOperation(segment, shell)
+      if (recycle) {
+        for (const target of recycle.targets) add(target, base)
       }
-      if (!optionsEnded && token.startsWith("-")) continue
-      if (!optionsEnded && (command === "rmdir" || command === "rd") && /^\/[sq]+$/i.test(token)) continue
-      candidates.add(stripMatchingQuotes(token))
-      if (candidates.size >= MAX_TARGET_DIRECTORIES) return [...candidates]
     }
   }
-  return [...candidates]
+  return { items, truncated }
+}
+
+function referencedPathCandidates(script: string, shell: string) {
+  const candidates = new Set<string>()
+  let truncated = false
+  const surfaces = [script, ...extractQuotedWrappers(script)]
+
+  const add = (candidate: string) => {
+    if (candidates.has(candidate)) return false
+    if (candidates.size >= MAX_REFERENCED_PATHS) {
+      truncated = true
+      return true
+    }
+    candidates.add(candidate)
+    return false
+  }
+
+  const consider = (rawToken: string) => {
+    if (rawToken.startsWith("-") || /^\d*(?:>>?|<<?|&>)\S*/.test(rawToken)) return false
+    const literal = literalPathToken(rawToken)
+    if (!literal || /^(?:https?:|data:)/i.test(literal)) return false
+    const normalizedPath = normalizeMsysPath(expandHome(literal))
+    const looksLikePath =
+      path.isAbsolute(normalizedPath) ||
+      /^\.{1,2}[\\/]/.test(normalizedPath) ||
+      normalizedPath.startsWith("~/") ||
+      /[\\/]/.test(normalizedPath) ||
+      /\.[A-Za-z0-9][A-Za-z0-9._-]{0,15}$/.test(normalizedPath)
+    return looksLikePath ? add(literal) : false
+  }
+
+  for (const surface of surfaces) {
+    const segments = splitSimpleSegments(surface, shell) ?? [surface]
+    for (const segment of segments) {
+      const tokens = simpleInvocationTokens(segment)
+      const start = tokens[0] && /[\\/]/.test(stripMatchingQuotes(tokens[0])) ? 0 : 1
+      for (const rawToken of tokens.slice(start)) {
+        if (consider(rawToken)) return { paths: [...candidates], truncated }
+      }
+      for (const match of segment.matchAll(/["']([^"'\r\n]+)["']/g)) {
+        if (consider(match[1] ?? "")) return { paths: [...candidates], truncated }
+      }
+    }
+  }
+  return { paths: [...candidates], truncated }
 }
 
 function directoryEntryType(entry: Dirent) {
@@ -1523,7 +2057,7 @@ async function inspectTargetDirectory(candidate: string, cwd: string, worktree: 
   try {
     canonical = await realpath(absolute)
   } catch {
-    return {}
+    return { uninspected: candidate }
   }
   if (!isWithin(worktree, canonical)) return { uninspected: candidate }
 
@@ -1617,6 +2151,7 @@ function localScriptCandidates(script: string, shell: string) {
 }
 
 async function fingerprintLocalScript(candidate: string, cwd: string, worktree: string) {
+  if (isCriticalOriginalPath(candidate) || /(?:^|[\\/])\.env(?:\.|$)/i.test(candidate)) return undefined
   const expanded = expandHome(candidate)
   const absolute = path.isAbsolute(expanded) ? expanded : path.resolve(cwd, expanded)
   let canonical: string
@@ -1685,14 +2220,146 @@ function combineSegmentDecisions(results: SegmentDecision[]): SegmentDecision {
   }
 }
 
+async function classifyHardDeletionPolicy(
+  segment: string,
+  input: ClassifyShellCommandInput,
+): Promise<StaticSecurityDecision | undefined> {
+  const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
+  const combined = surfaces.join("\n\n")
+
+  if (hasForcedRecursiveDelete(combined)) {
+    return {
+      verdict: "DENY",
+      rules: ["hard.forced-recursive-delete"],
+      reason: "Forced recursive deletion is forbidden. DO NOT retry any rm -rf, split -r/-f, or equivalent recursive deletion command",
+      fingerprints: [],
+    }
+  }
+
+  const roots = await trustedUserLocalTempRoots(input)
+  for (const surface of surfaces) {
+    const wrappedPowerShell = unwrapPowerShellCommand(surface)
+    const payload = wrappedPowerShell ?? surface
+    const payloadShell = wrappedPowerShell ? "powershell" : input.shell
+    const segments = splitCommandSegments(payload, payloadShell)
+    if (!segments) continue
+
+    let base: string | undefined = input.cwd
+    for (const item of segments) {
+      base = segmentBase(item, base, input.cwd)
+      const seg = item.text
+      const cd = parseCdSegment(seg)
+      if (cd) {
+        base = resolveCdBase(cd.dir, base)
+        continue
+      }
+
+      const deletion = parseDeleteInvocation(seg)
+      if (!deletion?.parseable || deletion.targets.length === 0) continue
+
+      for (const target of deletion.targets) {
+        const cleaned = stripMatchingQuotes(target)
+        if (hasNamedTempPathSegment(cleaned)) {
+          return {
+            verdict: "DENY",
+            rules: ["hard.temp-target-delete"],
+            reason: `Permanent deletion of temp/tmp targets is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+            fingerprints: [],
+          }
+        }
+        const literal = literalPathToken(target)
+        if (literal && backupPathIdentity(literal)) {
+          return {
+            verdict: "DENY",
+            rules: ["hard.backup-target-delete"],
+            reason: `Permanent deletion of backup targets is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+            fingerprints: [],
+          }
+        }
+        if (base && roots.length > 0 && (await isTrustedTempPath(target, base, roots))) {
+          return {
+            verdict: "DENY",
+            rules: ["hard.local-temp-delete"],
+            reason: `Permanent deletion inside the trusted Local Temp directory is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+            fingerprints: [],
+          }
+        }
+      }
+    }
+  }
+  return undefined
+}
+
 async function classifySegment(
   segment: string,
   base: string,
-  input: ClassifyShellCommandInput,
+  input: InternalClassifyInput,
 ): Promise<SegmentDecision> {
-  const segInput: ClassifyShellCommandInput = { ...input, script: segment, cwd: base }
+  const segInput: InternalClassifyInput = { ...input, script: segment, cwd: base }
+  const strictness: Strictness = input.strictness ?? "LOOSE"
 
-  if (isExplicitRecycleBinOperation(segment, input.shell)) {
+  if (segment.trim().startsWith("#")) {
+    return {
+      verdict: "ALLOW",
+      rules: ["operation.comment"],
+      reason: "The segment is a shell comment",
+    }
+  }
+
+  if (isPowerShellRecycleSetup(segment)) {
+    return {
+      verdict: "ALLOW",
+      rules: ["filesystem.recycle-bin-setup"],
+      reason: "Loads the operating-system recycle-bin API",
+    }
+  }
+
+  if (hasForbiddenRecycleDestruction(segment)) {
+    return {
+      verdict: "DENY",
+      rules: ["filesystem.recycle-bin-permanent-delete"],
+      reason: "Permanently deleting recycle-bin contents is forbidden",
+    }
+  }
+
+  const recycle = explicitRecycleBinOperation(segment, input.shell)
+  if (recycle) {
+    if (strictness === "HARD") {
+      const tempRoots = await trustedUserLocalTempRoots(segInput)
+      for (const target of recycle.targets) {
+        const literal = literalPathToken(target)
+        const protectedTarget = Boolean(
+          literal && (backupPathIdentity(literal) || hasNamedTempPathSegment(literal)),
+        )
+        const inLocalTemp = tempRoots.length > 0 && await isTrustedTempPath(target, base, tempRoots)
+        if (protectedTarget || inLocalTemp) {
+          return {
+            verdict: "DENY",
+            rules: ["filesystem.protected-target-delete"],
+            reason: `Removing a protected temporary or backup target is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+          }
+        }
+      }
+      if (recycle.targets.some(isCriticalDeletionTarget)) {
+        return {
+          verdict: "DENY",
+          rules: ["data.critical-delete"],
+          reason: `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`,
+        }
+      }
+      if (recycle.targets.some(isGeneralDataTarget)) {
+        return {
+          verdict: "DENY",
+          rules: ["data.destructive-delete"],
+          reason: `Attempts to delete a durable structured data file. ${PERMANENT_DELETE_GUIDANCE}`,
+        }
+      }
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.recycle-bin"],
+        reason: "Moving this item to the recycle bin requires review",
+      }
+    }
     return {
       verdict: "ALLOW",
       rules: ["filesystem.recycle-bin"],
@@ -1700,54 +2367,103 @@ async function classifySegment(
     }
   }
 
-  const namedTempDecision = classifyNamedTempDeletionPolicy(segment, segInput)
-  if (namedTempDecision) {
-    return { verdict: namedTempDecision.verdict, rules: namedTempDecision.rules, reason: namedTempDecision.reason }
+
+  const stripped = stripHarmlessPrefixes(segment)
+  if (stripped && stripped !== segment.trim()) {
+    return classifySegment(stripped, base, input)
   }
 
-  const userLocalTempDecision = await classifyUserLocalTempSegment(segment, segInput)
-  if (userLocalTempDecision) {
-    return {
-      verdict: userLocalTempDecision.verdict,
-      rules: userLocalTempDecision.rules,
-      reason: userLocalTempDecision.reason,
+  if (strictness === "HARD") {
+    const hardDecision = await classifyHardDeletionPolicy(segment, segInput)
+    if (hardDecision) {
+      return { verdict: hardDecision.verdict, rules: hardDecision.rules, reason: hardDecision.reason }
+    }
+    const backupDecision = await classifyBackupPolicy(segment, segInput)
+    if (backupDecision) {
+      if (backupDecision.verdict === "ALLOW" && backupDecision.rules.includes("filesystem.backup-delete")) {
+        return {
+          verdict: "DENY",
+          rules: ["hard.backup-delete"],
+          reason: `Permanent deletion of backup targets is forbidden. ${PERMANENT_DELETE_GUIDANCE}`,
+        }
+      }
+      return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
+    }
+  } else {
+    if (!segInput.cwdUnknown) {
+      const namedTempDecision = await classifyNamedTempDeletionPolicy(segment, segInput)
+      if (namedTempDecision) {
+        return { verdict: namedTempDecision.verdict, rules: namedTempDecision.rules, reason: namedTempDecision.reason }
+      }
+
+      const userLocalTempDecision = await classifyUserLocalTempSegment(segment, segInput)
+      if (userLocalTempDecision) {
+        return {
+          verdict: userLocalTempDecision.verdict,
+          rules: userLocalTempDecision.rules,
+          reason: userLocalTempDecision.reason,
+        }
+      }
+      const backupDecision = await classifyBackupPolicy(segment, segInput)
+      if (backupDecision) {
+        return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
+      }
     }
   }
 
-  const backupDecision = await classifyBackupPolicy(segment, segInput)
-  if (backupDecision) {
-    return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
-  }
-
   const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
-  const combined = surfaces.join("\n\n")
+  const combined = surfaces.map(maskHeredocBody).join("\n\n")
   const reviewSignals = new Map<string, string>()
   const explicitDisposableCleanup = isExplicitDisposableCleanup(segment) && surfaces.length === 1
+
+  const knownSafe = isKnownSafeSegment(segment)
+  const hasExpansion = hasDynamicShellExpansion(segment, input.shell)
+  if (knownSafe && !hasExpansion && !hasFileWritePrimitive(segment)) {
+    return {
+      verdict: "ALLOW",
+      rules: ["operation.known-safe"],
+      reason: "The segment is a recognized read-only or normal low-risk development action",
+    }
+  }
 
   for (const rule of SECURITY_SIGNAL_RULES) {
     if (rule.test(combined)) {
       if (DEFINITE_DESTRUCTIVE_RULES.has(rule.id)) {
-        if (rule.id === "filesystem.forced-recursive-delete" && explicitDisposableCleanup) continue
+        if (rule.id === "filesystem.forced-recursive-delete" && explicitDisposableCleanup && strictness !== "HARD") continue
         return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
       }
       reviewSignals.set(rule.id, rule.reason)
     }
   }
-  if (hasDataDestruction(combined)) {
+  if (hasCriticalDataDestruction(combined)) {
     return {
       verdict: "DENY",
-      rules: ["data.destructive-delete"],
-      reason: "Attempts to delete user data, source data, credentials, or durable structured files",
+      rules: ["data.critical-delete"],
+      reason: strictness === "HARD"
+        ? `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`
+        : "Attempts to delete credential or key material",
     }
+  }
+  if (hasGeneralDataDestruction(combined)) {
+    if (strictness === "HARD") {
+      return {
+        verdict: "DENY",
+        rules: ["data.destructive-delete"],
+        reason: `Attempts to permanently delete a durable structured data file. ${PERMANENT_DELETE_GUIDANCE}`,
+      }
+    }
+    reviewSignals.set(
+      "data.destructive-delete",
+      "Attempts to delete user data or durable structured files and requires review",
+    )
   }
   if (hasDestructiveOverwrite(combined)) {
-    return {
-      verdict: "DENY",
-      rules: ["data.destructive-overwrite"],
-      reason: "Attempts in-place destructive modification of durable structured data",
-    }
+    reviewSignals.set(
+      "data.destructive-overwrite",
+      "Attempts in-place destructive modification of durable structured data",
+    )
   }
-  if (explicitDisposableCleanup) {
+  if (explicitDisposableCleanup && strictness !== "HARD") {
     return {
       verdict: "ALLOW",
       rules: ["cleanup.disposable"],
@@ -1782,7 +2498,7 @@ async function classifySegment(
     }
   }
 
-  if (DELETE_PRIMITIVE.test(combined)) {
+  if (hasDeletePrimitive(combined)) {
     return {
       verdict: "ASK",
       rules: ["filesystem.scoped-delete"],
@@ -1790,13 +2506,13 @@ async function classifySegment(
     }
   }
 
-  const combinedWithoutFdMerges = combined.replace(/\d*>&\d+/g, "")
+  const combinedWithoutFdMerges = combined
+    .replace(/>\s*\/dev\/(?:null|stdout|stderr)\b/gi, "")
+    .replace(/>\s*\$null\b/gi, "")
+    .replace(/\d*>&\d+/g, "")
   if (
     /\b(?:kill|pkill|killall|taskkill|stop-process)\b/i.test(combined) ||
     /\b(?:curl|wget|invoke-webrequest|iwr|irm|ssh|scp|rsync)\b/i.test(combined) ||
-    /\b(?:pip(?:3)?\s+install|npm\s+(?:install|i)|pnpm\s+(?:install|add)|yarn\s+(?:install|add)|bun\s+(?:install|add))\b/i.test(
-      combined,
-    ) ||
     /\b(?:sudo|runas)\b/i.test(combined) ||
     /(?:^|[^>])>(?!>)/m.test(combinedWithoutFdMerges)
   ) {
@@ -1824,20 +2540,21 @@ async function classifySegment(
 
 async function classifySegments(
   script: string,
-  input: ClassifyShellCommandInput,
+  input: InternalClassifyInput,
   depth = 0,
 ): Promise<SegmentDecision> {
   if (depth > MAX_WRAPPER_DEPTH) {
     return { verdict: "ASK", rules: ["execution.wrapper"], reason: "Command wrappers exceed the review depth limit" }
   }
 
-  const rawSegments = splitSimpleSegments(script, input.shell) ?? [script]
+  const rawSegments = splitCommandSegments(script, input.shell) ?? [{ text: script }]
   const results: SegmentDecision[] = []
   let base: string | undefined = input.cwd
   let sawDirectoryChange = false
 
   for (const raw of rawSegments) {
-    const segment = raw.trim()
+    base = segmentBase(raw, base, input.cwd)
+    const segment = raw.text.trim()
     if (!segment) continue
     const cd = parseCdSegment(segment)
     if (cd) {
@@ -1845,7 +2562,11 @@ async function classifySegments(
       base = resolveCdBase(cd.dir, base)
       continue
     }
-    const decision = await classifySegment(segment, base ?? input.cwd, input)
+    const decision = await classifySegment(
+      segment,
+      base ?? input.cwd,
+      base === undefined ? { ...input, cwdUnknown: true } : input,
+    )
     results.push(decision)
   }
 
@@ -1930,15 +2651,6 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
       fingerprints: [],
     }
   }
-  if (isExplicitRecycleBinOperation(source, input.shell)) {
-    return {
-      verdict: "ALLOW",
-      rules: ["filesystem.recycle-bin"],
-      reason: "Moves items to the recoverable operating-system recycle bin",
-      fingerprints: [],
-    }
-  }
-
   const executableSurfaces = [source, ...extractDecodedPayloads(source), ...extractQuotedWrappers(source)]
   const localScriptSurfaces: string[] = []
   const fingerprints: ScriptFingerprint[] = []
@@ -1946,6 +2658,8 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   const uninspectedLocalScripts: string[] = []
   const targetDirectories: TargetDirectoryReviewContext[] = []
   const uninspectedTargetDirectories: string[] = []
+  const referenced = referencedPathCandidates(source, input.shell)
+  const deletionTargets = deletionTargetCandidates(source, input.shell, input.cwd)
   let cloudScriptChars = 0
 
   for (const candidate of localScriptCandidates(source, input.shell)) {
@@ -1968,8 +2682,8 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     }
   }
 
-  for (const candidate of deletionTargetCandidates(source)) {
-    const inspected = await inspectTargetDirectory(candidate, input.cwd, input.worktree)
+  for (const candidate of deletionTargets.items) {
+    const inspected = await inspectTargetDirectory(candidate.target, candidate.cwd, input.worktree)
     if (inspected.context) targetDirectories.push(inspected.context)
     if (inspected.uninspected) uninspectedTargetDirectories.push(inspected.uninspected)
   }
@@ -1979,6 +2693,8 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     uninspectedLocalScripts,
     targetDirectories,
     uninspectedTargetDirectories,
+    referencedPaths: referenced.paths,
+    referencedPathsTruncated: referenced.truncated,
   }
   const decisionState = { fingerprints, reviewContext }
   const executableCombined = executableSurfaces.join("\n\n")
@@ -1990,11 +2706,20 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     return { verdict: "DENY", rules: segmentDecision.rules, reason: segmentDecision.reason, ...decisionState }
   }
 
+  if (deletionTargets.truncated) {
+    return {
+      verdict: "ASK",
+      rules: [...new Set([...segmentDecision.rules, "filesystem.deletion-targets-truncated"])],
+      reason: "The command has more deletion targets than can be inspected safely",
+      ...decisionState,
+    }
+  }
+
   if (
-    segmentDecision.verdict !== "DENY" &&
     isExplicitDisposableCleanup(source) &&
     executableSurfaces.length === 1 &&
-    localScriptSurfaces.length === 0
+    localScriptSurfaces.length === 0 &&
+    (input.strictness ?? "LOOSE") !== "HARD"
   ) {
     return {
       verdict: "ALLOW",
@@ -2014,11 +2739,33 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     for (const rule of SECURITY_SIGNAL_RULES) {
       if (rule.test(localScriptCombined)) extraSignals.set(rule.id, rule.reason)
     }
-    if (hasDataDestruction(localScriptCombined)) {
+    if (hasCriticalDataDestruction(localScriptCombined)) {
+      extraSignals.set("data.critical-delete", "Local script may delete credential or key material and requires review")
+    }
+    if (hasGeneralDataDestruction(localScriptCombined)) {
       extraSignals.set("data.destructive-delete", "Local script may delete durable data and requires semantic review")
     }
     if (hasDestructiveOverwrite(localScriptCombined)) {
       extraSignals.set("data.destructive-overwrite", "Local script may overwrite durable data and requires semantic review")
+    }
+    if (hasLocalScriptReviewSignal(localScriptCombined)) {
+      extraSignals.set("execution.local-script-signal", "Local script contains a review-requiring primitive")
+    }
+  }
+
+  if (
+    segmentDecision.verdict === "ASK" &&
+    segmentDecision.rules.length === 1 &&
+    segmentDecision.rules[0] === "execution.local-script" &&
+    localScriptSurfaces.length > 0 &&
+    uninspectedLocalScripts.length === 0 &&
+    extraSignals.size === 0
+  ) {
+    return {
+      verdict: "ALLOW",
+      rules: ["execution.local-script-inspected"],
+      reason: "The local script was fully read and fingerprinted and contains no review-requiring behavior",
+      ...decisionState,
     }
   }
 

@@ -1,276 +1,220 @@
 # opencode-bash-classifier
 
-Execution-boundary command safety for OpenCode's native `bash` tool. A fast
-local static classifier blocks clearly destructive commands and statically
-allows safe ones (including temp cleanup, `cd` chains, and chained commands);
-everything else is sent to an OpenAI-compatible LLM that can inspect the
-filesystem read-only through three tools before deciding.
+[简体中文](README.zh-CN.md)
 
-It deliberately does **not** replace the built-in Bash tool. OpenCode 1.18.5
-does not expose a plugin hook for replacing its Bash-card renderer, so a custom
-Bash tool cannot provide an always-collapsed, one-line semantic summary that
-expands on click. Keeping the native tool preserves OpenCode's shell selection,
-quoting, process handling, permission checks, output capture, and TUI rendering.
+Version 0.4.0 — an execution-boundary command safety classifier for OpenCode's native `bash` tool.
 
-## What it changes
+## Overview
 
-The plugin registers `tool.execute.before` and reviews only calls whose tool ID
-is `bash`. It never spawns the requested command itself and never rewrites the
-meaning of a command. Two optional hardening features touch the tool arguments:
+The plugin leaves OpenCode's native Bash tool untouched and classifies every command **before** it runs by registering `tool.execute.before` / `tool.execute.after` hooks. Classification is **static-first**: a fast local classifier reviews each command, and only commands it cannot prove safe (`ASK`) — or commands forced into review by a previous rejection or failure — are sent to the optional dynamic OpenAI-compatible reviewer. That design is what keeps dynamic requests rare; the exact reduction depends on the workload, so no fixed percentage is promised.
 
-- it may raise the bash tool's `timeout` ceiling for commands that are neither
-  downloads nor builds (see Hard timeout below);
-- it may append a handle-isolating redirection to detached-start commands such
-  as `start` / `cmd /c start` / `Start-Process` (see Detached start isolation
-  below), which otherwise inherit the bash tool's pipe and hang the session.
+The plugin exposes **two user policies**, `LOOSE` and `HARD`. The policy label and the `strictness` value are never sent to the model: the bundled auditor selects an **independent system prompt** for each policy and sends only that prompt together with the review data. Block messages likewise never reveal which policy is active.
 
-Neither changes what the command does; the command string is otherwise never
-touched.
+It deliberately does **not** replace the built-in Bash tool, so OpenCode's shell selection, quoting, process handling, permission checks, output capture, and TUI rendering are all preserved. The command string itself is never rewritten for classification purposes; two optional hardening features may adjust the tool *arguments* (a default timeout and detached-start handle isolation), never the meaning of the command.
+
+`apply_patch` patches containing a `*** Delete File:` line are blocked statically with a message telling the agent to delete files through bash instead, so both the classifier and OpenCode's permission layer can review the deletion.
 
 ```text
 native Bash request
   -> local static classifier (per-segment, worst-case combine)
        ALLOW -> OpenCode native Bash
-       DENY  -> block
-       ASK   -> LLM reviewer (tool-enhanced, OpenAI-compatible)
+       DENY  -> blocked
+       ASK or forced context -> dynamic LLM reviewer (tool-enhanced, OpenAI-compatible)
                   ALLOW -> OpenCode native Bash
-                  DENY  -> block
+                  DENY  -> blocked (HARD: bypass attempts also abort the session)
 ```
 
-The local classifier:
+## Static classification
 
-- splits chained commands on `&&`, `||`, `;`, and newlines and reviews each
-  segment independently, combining with the worst result: any DENY blocks the
-  whole command, any ASK defers the whole command to dynamic review, and only
-  commands where every segment is ALLOW run without review;
-- resolves `cd`/`pushd`/`Set-Location` segments and uses the changed directory
-  as the base for later relative paths, so `cd <temp> && rm -rf sub` is allowed
-  while `cd /etc && rm -rf evil` is blocked (no cd escape, no false rejection);
-- tolerates harmless tails after file operations, so
-  `rm -rf <temp>/x && echo done`, `rm -rf <temp>/x || true`, and
-  `rm -rf <temp>/x && mkdir -p <temp>/x` are allowed without cloud review;
-- normalizes msys-style `/c/...` paths inside the Local Temp whitelist for
-  copy and move targets;
-- hard-blocks direct operations whose destructive effect is explicit, including
-  forced recursive directory deletion outside the named-temp exception,
-  filesystem-root deletion, disk and
-  backup destruction, system-service termination, shutdown, broad forced
-  process termination, and destructive database or infrastructure operations;
-- preserves explicit exceptions for narrowly scoped regenerated dependencies,
-  build outputs, coverage, caches, and operating-system temporary files;
-- statically allows a pure `rm`, `Remove-Item`, or equivalent deletion command
-  when any target text contains `tmp` or `temp`, case-insensitively; the match is
-  intentionally a broad substring match, and other deletion targets in the same
-  pure deletion command do not need to match;
-- applies the same named-temp deletion rule through pure PowerShell, Bash, WSL,
-  cmd, and PowerShell encoded-command wrappers;
-- keeps only explicit filesystem-root deletion and chained process, service,
-  disk, shutdown, or other non-file destructive behavior outside that broad
-  named-temp exception;
-- always allows pure, recoverable moves to the operating-system trash/recycle
-  bin, including `trash`, `trash-put`, `gio trash`, `send2trash`, and
-  PowerShell recycle-bin APIs, even when the target is a real project tree;
-- does not apply the recycle-bin exception to empty/purge operations, permanent
-  deletion, or commands that chain another destructive action;
-- treats files and subdirectories strictly below the current Windows user's
-  `%LOCALAPPDATA%\Temp` as disposable, allowing pure delete, copy, move, and
-  rename operations there without cloud review, including failed clones and
-  project-shaped directories;
-- does not extend Local Temp copy/move/rename handling to path or symlink
-  escapes, executing Temp content, or destructive process/service/system
-  operations chained to the file operation; deletion follows the broader
-  named-temp rule above;
-- recognizes exact `.backup`, `-backup`, `.bak`, and `-bak` suffixes with
-  optional trailing decimal digits, such as `a.ts.backup2`, `project-backup10`,
-  `data.json.bak2`, and `draft.bak`;
-- allows permanent backup deletion only when an exact same-directory original
-  exists, both entries have the same filesystem type, and the backup creation
-  time is strictly older than two minutes;
-- allows backup names to be created only by `cp`, `copy`, or `Copy-Item`, and
-  blocks moving or renaming files and directories into backup names;
-- excludes credential and private-key material such as `.env`, `.key`, `.pem`,
-  `.p12`, `.pfx`, `.ppk`, `.jks`, `.keystore`, `.kdbx`, `.gpg`, and `.age`
-  from all permanent backup exceptions, checking both the copy source and the
-  suffix-stripped backup name; ordinary `.csv`, `.json`, and `.xlsx` backups
-  remain eligible;
-- sends other security-sensitive or unknown commands to the LLM reviewer for
-  semantic review;
-- statically allows common test runners, including Bun, npm/npx, Node test,
-  pytest, Jest, Vitest, Mocha, Playwright, Cargo, Go, .NET, Maven, Gradle, and
-  CTest, including harmless `2>&1` descriptor merging;
-- treats missing context and unfamiliar test or development commands as
-  good-faith activity in the reviewer policy unless concrete destructive
-  behavior is visible;
-- instructs the reviewer not to invent hidden targets, prior renames or moves,
-  malicious intent, production importance, or other worst-case facts absent
-  from the review package;
-- caches cacheable dynamic `ALLOW` decisions for 30 minutes using the exact
-  command, canonical working directory, shell, static rules, inspected script
-  fingerprints, and deletion-target directory snapshots;
-- always sends broad process-termination commands, including WSL/interpreter
-  wrappers such as `wsl -- bash -c "killall ..."`, to the LLM reviewer;
-- sends destructive `find ... -delete` commands to the LLM reviewer, while
-  preserving the narrow `/tmp` plus age-filter cleanup exception;
-- decodes common PowerShell and Base64 wrappers before classification;
-- reads bounded local scripts inside the worktree and supplies their paths,
-  SHA-256 fingerprints, and contents to the reviewer;
-- supplies a bounded, non-recursive directory listing for directory-deletion
-  targets sent to cloud review, allowing the reviewer to recognize source trees,
-  project manifests, repositories, and other durable project structure;
-- verifies inspected script fingerprints again before returning control to the
-  native Bash tool;
-- fails open when cloud review is disabled, unavailable, times out, or returns
-  an invalid response; only an explicit dynamic `DENY` blocks execution.
+The local classifier splits chained commands into segments at `&&`, `||`, `;`, newlines, `|`, and `&`, then reviews each segment independently and aggregates with the **worst** result: any `DENY` blocks the whole command, any `ASK` defers the whole command to dynamic review, and only commands where every segment is `ALLOW` run without review. Common `timeout`, WSL, subshell, and heredoc forms are handled conservatively; complex or unparseable syntax falls back to `ASK`.
 
-The reviewer returns exactly `ALLOW` or `DENY` plus a `reason` field. For
-`ALLOW`, `reason` is exactly `""` and no safety explanation is generated. For
-`DENY`, it is a short English reason. There is no confidence score, operation
-list, or user-confirmation state.
+### Directory-change (`cd`) tracking
 
-Blocked commands use these messages:
+`cd`/`pushd`/`Set-Location` segments change the base directory used to resolve literal targets in the *following* segments, but the changed base is propagated **only through consecutive success-required `&&` chains**. After a `||`, `;`, newline, pipe (`|`), or background (`&`) connector, the next segment resolves against the original working directory again — the changed directory does not leak across those connectors. For example `cd /tmp && rm -rf x` resolves `x` against `/tmp`, while `cd /tmp; rm -rf x` resolves `x` against the original working directory.
 
-```text
-Command blocked by static classifier : <reason>
-Command blocked by dynamic classifier:<reason>
+### LOOSE (default) — good faith, but no accidental data loss
+
+LOOSE assumes a well-intentioned developer and exists to prevent accidental, irreversible loss of durable data.
+
+- **Named temp deletion**: a pure deletion command (`rm`, `Remove-Item`, and equivalents, through bash/PowerShell/WSL/cmd/encoded wrappers) is allowed only when **every** permanent deletion target resolves, against the current base directory, to a path that contains a complete, case-insensitive directory segment exactly `temp` or `tmp`. Substring matches such as `template`, `tmp-marker`, `attempt`, or `.tmp` inside a longer name do **not** qualify. A `..` segment in any target disqualifies it, and a mixed target list cannot be shielded — one temp target does not excuse the others.
+- **User Local Temp**: pure delete/copy/move/rename operations strictly below the canonical `%LOCALAPPDATA%\Temp` directory (resolved with `realpath`, with `..` and junction/symlink escapes rejected) are allowed.
+- **Backups**: a backup name (`.backup`, `-backup`, `.bak`, `-bak`, optionally followed by digits) may be created only by copying; moving/renaming into a backup name is denied. Permanent backup deletion is allowed only for a standalone, verified target where an exact same-directory original exists, filesystem types match, and the backup is older than two minutes.
+- **Data files**: deleting `.csv`, `.json`, `.yaml`, `.db`, `.sqlite`, `.xlsx`, `.pdf`, and similar durable files is not statically denied — it becomes at least `ASK` and is evaluated on concrete scope and directory contents. Permanent deletion of critical credential material — `.env`, `.pem`, `.key`, `.p12`, and similar private-key files — is statically `DENY`.
+- **Recycle bin**: a real, pure move to the OS trash/recycle bin is allowed, even for project-looking targets; emptying, purging, or directly deleting items inside the recycle bin is denied.
+- **Normal work**: common test runners, builds, package installs, read-only inspection commands, git local operations, and narrowly scoped cleanup of disposable targets (`node_modules`, `dist`, `build`, `coverage`, caches) are statically allowed.
+- **Local scripts**: local scripts inside the worktree are read (up to 256 KB each, up to 8), fingerprinted, and scanned for delete/kill/write primitives. A script that was fully read, fingerprinted, and contains no review-requiring behavior is statically allowed; a script containing `rm`, `pkill`, writes, or similar primitives sends the command to dynamic review.
+- **Dynamic ALLOW cache**: successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) so an identical command is not re-sent; the cache only applies in LOOSE mode, is skipped when the review was forced by a previous failure or the static context is not fully inspectable, and dynamic `DENY` is never cached.
+
+### HARD — strictest, no relaxations
+
+- All forced recursive deletions (`rm -rf`, `Remove-Item -Recurse -Force`, and equivalent flag combinations) are statically `DENY`.
+- There is **no** temp/tmp, Local Temp, or backup exception in HARD mode; deleting any named temp, Local Temp, or backup target is denied.
+- Permanently deleting **or moving to the recycle bin** a durable data file is denied; other genuine recycle-bin moves are at least `ASK`.
+- Emptying, purging, or directly deleting items inside the recycle bin is denied.
+- No caching of dynamic `ALLOW` results.
+- After **any** rejection, the next bash command is forced through dynamic review with the previous rejection attached as context; the reviewer must return `{decision, reason, bypassing}`, and a detected bypass (`bypassing: true`) blocks the command and best-effort aborts the session via `session.abort`.
+- The dynamic reviewer runs its most pessimistic prompt: no temp/backup/recycle-bin/rm-rf relaxations, and ambiguity leans toward `DENY`.
+
+### Compound-command examples
+
+| Command | LOOSE | HARD |
+|---|---|---|
+| `rm -rf ./tmp/x && rm -rf important` | DENY (second segment is a forced recursive delete) | DENY |
+| `rm -rf ./tmp/x && echo removed` | ALLOW (temp segment + harmless tail) | DENY (forced recursive delete) |
+
+### Blocked-command messages
+
+Every **final** static, dynamic, and `fail_close` block appends the following suffix **verbatim**:
+
+> DO NOT retry the same command or try using alternative method.Skip the step or stop and report the user if it's a essential step of the work
+
+In HARD mode an additional, command-family-specific retry prohibition is inserted before the suffix when the block reason matches a deletion family (for example, "DO NOT retry any rm -rf, split -r/-f, recursive Remove-Item, or equivalent deletion commands."). The visible message never names the active policy.
+
+`fail_ask` is **not** a final rejection: it explains the approval flow and asks the agent to call `bash_classifier_confirm` with the printed `requestId` (see below), and it does not carry the suffix. The separate `apply_patch` routing error instead tells the agent to delete files through bash.
+
+## Dynamic LLM reviewer
+
+The bundled `auditor.py` is an independent, provider-neutral reviewer that talks to any **OpenAI-compatible** endpoint. It uses only the Python standard library and runs with `-I -B` isolated flags. It requires an endpoint that supports:
+
+- OpenAI-compatible **tool calling** (function calling) with a `tools` array;
+- **JSON object** output mode (`response_format: {"type": "json_object"}`).
+
+Only endpoints you have verified to support both requirements will work; no provider capability is claimed here.
+
+### Round budget
+
+`maxRounds` is the number of rounds in which tool calls are allowed: **LOOSE defaults to 1 (configurable 1–3), HARD defaults to 2 (configurable 1–5)**. Once the round budget is exhausted, the auditor makes one final request with tools disabled to force a conclusion, and the whole review may use at most **8 tool calls** in total. For reasonable latency prefer a low-latency, lightweight model without a thinking mode.
+
+### Result contract
+
+The model must return exactly one JSON object in every final answer:
+
+- LOOSE: `{"decision": "ALLOW"|"DENY", "reason": "..."}` — `ALLOW` requires an empty reason.
+- HARD: `{"decision": "ALLOW"|"DENY", "reason": "...", "bypassing": boolean}`.
+
+Neither the policy label nor the `strictness` value is included in the model payload; the policy merely selects which system prompt the auditor sends.
+
+### Configuration requirements
+
+- There is **no default provider, URL, model, or API key**. `dynamicReview` must provide `baseURL`, `model`, and exactly one of `apiKey` or `apiKeyEnv`.
+- `baseURL` is an OpenAI-compatible base URL; `/chat/completions` is appended if not already present. **HTTP is allowed only for loopback hosts** (`localhost`, `127.*`, `::1`); any remote endpoint must use **HTTPS**. URLs containing userinfo or a fragment are rejected.
+- Redirects are **not** followed.
+- `apiKeyEnv` names an environment variable the key is read from (the name must be a valid identifier). The plugin never reads `~/.env` and never falls back to `API_KEY`-style variables.
+- Missing or invalid dynamic configuration makes the **reviewer unavailable** — the plugin still loads and runs normally; the configured fail policy then governs. An unconfigured reviewer is not a plugin startup failure.
+- Config changes require restarting OpenCode.
+
+### What the reviewer can see (data disclosure)
+
+For `ASK` (or forced) commands the following is sent to the configured endpoint:
+
+- the exact command, and the canonical `cwd` / worktree paths;
+- up to 8 inspected local scripts (each ≤ 256 KB, at most 256,000 attached script characters total; the whole review package is capped at 1 MB);
+- bounded, non-recursive directory-entry listings for deletion targets (≤ 4 directories, ≤ 200 entries each);
+- paths explicitly referenced by the command (bounded, with a truncation flag);
+- bounded context from a previous rejection (HARD) or a previous failure in the same session (including a short output tail).
+
+The API key itself is sent **only** in the `Authorization` header of requests to the configured endpoint (redirects are not followed). Remember that command lines, paths, and local source code can be sensitive; weigh this before enabling a third-party reviewer, and prefer ZDR (as a privacy-conscious hosting choice), a self-hosted endpoint, or disabling the reviewer for sensitive work.
+
+### Auditor read access and sensitive files
+
+The reviewer has exactly two local, read-only tools — `read_file` and `list_directory`. There is **no glob** tool. Both tools stay read-only and bounded (256 KB per read, 200 entries per listing), treat results as untrusted data, and reject:
+
+- sensitive paths: `.env`, `.env.*`, and `*.env` (for example `api-key.env`); private-key material (`.pem`, `.key`, `.p12`, `.pfx`, `.ppk`, `.jks`, `.keystore`, `.kdbx`, `.gpg`, `.age`); npm/pypi config (`.npmrc`, `.pypirc`); `.netrc`; and `.ssh`, `.gnupg`, and `.aws` — a path with any of these as a directory component is forbidden in full, including every descendant, so nothing inside those directories can be read or listed (not just `.aws/credentials`);
+- symlinks, junctions, reparse points, devices, and other non-regular files.
+
+`dynamicReview.allowFullReadAccess` (user-facing concept `ALLOW_FULL_READ_ACCESS`; the public JSON field is the camelCase name) defaults to `false`, in which case the tools may only inspect:
+
+- the canonical working directory of the command, and below;
+- system temporary roots — on Windows `os.tmpdir()` (the user's temp) plus `%LOCALAPPDATA%\Temp`; on Linux `/tmp` and `os.tmpdir()`;
+- exact paths explicitly referenced by the command (an explicit file authorizes only that file; an explicit directory authorizes only listing that directory).
+
+Setting it to `true` lets the bounded read-only tools inspect ordinary files and directories anywhere on the filesystem; sensitive files, links, reparse points, devices, and non-regular files remain forbidden either way. The broader the access, the more project data a third-party endpoint could receive — choose deliberately.
+
+Inspection failure is mode-dependent: LOOSE decides from the remaining visible context with a good-faith bias, while HARD refuses `ALLOW` when a declared uninspected script or target cannot be inspected completely and reliably.
+
+### Fail policy
+
+When the reviewer is unconfigured, unavailable, times out, or returns an invalid result, the `failPolicy` decides:
+
+| Policy | Meaning |
+|---|---|
+| `fail_ask` (default) | Human-in-the-loop: the command is blocked and a `bash_classifier_confirm` tool is offered to request user approval. |
+| `fail_close` | Block the command. |
+| `fail_open` | Let the command proceed. |
+
+The three combinations to remember:
+
+- **HARD + `fail_close`** is the strictest unattended configuration.
+- **LOOSE + `fail_ask`** is the human-in-the-loop configuration with the broadest good-faith behavior while a human can still veto.
+- **LOOSE + `fail_open`** is the most permissive unattended configuration **and the riskiest**: a reviewer outage silently disables the semantic layer, leaving only the static classifier. Use only if you accept that risk.
+
+The default is `fail_ask`, not `fail_open`.
+
+### Human approval (`fail_ask`)
+
+Because a `before` hook cannot create a native permission prompt itself, the plugin registers a custom tool, `bash_classifier_confirm`, which calls OpenCode's `context.ask`. The blocked message tells the agent to call it with the printed `requestId`; the pending request expires after **5 minutes**. Before approval the agent must not retry the command or use an alternative; if the user approves, only the **exact** command — matching command, working directory, and strictness fingerprint — is allowed **once**; a stale approval for a different command is discarded. OpenCode's own permission configuration still applies afterwards and may approve or deny via UI or auto-approval settings.
+
+### Rejection / failure escalation (session-scoped)
+
+- **HARD only**: after **any** static, dynamic, or policy rejection, the next bash command in the session is forced through dynamic review regardless of its static result, with the previous rejection attached as context. The reviewer must return `{decision, reason, bypassing}`; if it judges the new command to be a bypass (`bypassing: true`), the command is blocked and the session is aborted via `session.abort`. LOOSE never records rejections and performs no bypass detection.
+- **Both modes**: after a bash command **exits non-zero**, the next execution of a local script in that session is forced through dynamic review with the failure context (command, exit code, bounded output tail) attached. An ordinary successful command does not clear a pending failure; only the forced review run that consumed it does.
+- All state (`lastRejected`, `lastFailed`, pending approvals, allow-cache) is per-session, expires after **30 minutes**, is bounded to **512 sessions**, and is discarded immediately when the session is deleted (`session.deleted`).
+- Successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) only in LOOSE mode when the static context is fully inspectable and the review was not failure-forced; dynamic `DENY` is never cached.
+
+## Configuration
+
+Options live in the OpenCode `plugin` tuple:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "<absolute-path-to-plugin>",
+      {
+        "strictness": "LOOSE",
+        "failPolicy": "fail_ask",
+        "dynamicReview": {
+          "baseURL": "https://api.example.com/v1",
+          "model": "your-model-id",
+          "apiKeyEnv": "MY_REVIEW_API_KEY",
+          "timeoutMs": 30000,
+          "maxRounds": 1,
+          "allowFullReadAccess": false,
+          "pythonPath": "python",
+          "auditorPath": "src/security/auditor.py"
+        }
+      }
+    ]
+  ]
+}
 ```
 
-## Windows process supervisor
+`<absolute-path-to-plugin>` is the absolute path to the plugin folder. `pythonPath` may be a bare interpreter name (resolved through PATH at spawn time) or a package-relative path to an existing interpreter; `auditorPath` resolves against the package root. Restart OpenCode after changing any of these options.
 
-On Windows, OpenCode 1.x can keep waiting after a shell exits when a descendant
-inherits its stdout/stderr pipe. Its timeout cleanup can hit the same wait. The
-optional native supervisor fixes that process boundary without changing the
-agent's command:
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `shell` | string | OpenCode's shell | Real-shell override; also the classifier's dialect hint. |
+| `securityEnabled` | boolean | `true` | Enable the classifier hooks entirely. |
+| `strictness` | `"LOOSE" \| "HARD"` | `"LOOSE"` | Selects the static ruleset and the dynamic system prompt. |
+| `failPolicy` | `"fail_ask" \| "fail_open" \| "fail_close"` | `"fail_ask"` | Behavior when the reviewer is unavailable or fails. |
+| `dynamicReview.baseURL` | string | — | OpenAI-compatible base URL (`/chat/completions` is appended). HTTP only for loopback hosts; remote endpoints must use HTTPS. |
+| `dynamicReview.model` | string | — | Model ID. |
+| `dynamicReview.apiKey` | string | — | API key (exactly one of `apiKey` / `apiKeyEnv`). |
+| `dynamicReview.apiKeyEnv` | string | — | Name of the env var holding the API key. |
+| `dynamicReview.timeoutMs` | number | `30000` | Python reviewer timeout (1–120000). |
+| `dynamicReview.maxRounds` | number | LOOSE `1`, HARD `2` | Tool-enabled rounds (LOOSE 1–3, HARD 1–5). |
+| `dynamicReview.allowFullReadAccess` | boolean | `false` | Let the auditor's bounded read-only tools inspect the whole filesystem (`ALLOW_FULL_READ_ACCESS`). |
+| `dynamicReview.pythonPath` | string | PATH lookup | Python interpreter; a path is resolved against the package root. |
+| `dynamicReview.auditorPath` | string | bundled `auditor.py` | Path to the auditor script. |
+| `hardTimeoutMs` | number | `120000` | Default timeout applied to non-download/build commands without one; `0` disables. |
+| `detachedStartIsolation` | boolean | `true` | Append handle isolation to `start`/`Start-Process` when the supervisor is inactive. |
+| `supervisorEnabled` | boolean | `true` on Windows | Use the native shell supervisor when its executable exists. |
+| `supervisorPath` | string | package default | Path to the supervisor `bash.exe`. |
 
-- the real shell starts suspended and enters a Windows Job Object before it can
-  create descendants;
-- it inherits private relay pipes, never OpenCode's pipe handles;
-- normal shell exit gets a bounded 300 ms output drain and does not wait for a
-  detached descendant;
-- forced supervisor termination closes a `KILL_ON_JOB_CLOSE` job and terminates
-  the Windows process tree.
+The plugin also supports `reviewCommand` for programmatic test injection only; it is never wired by the plugin itself.
 
-Build it once before rebuilding/restarting OpenCode:
-
-```bash
-bun run build:supervisor
-```
-
-On Windows it is enabled automatically when the executable exists. Missing or
-disabled supervisors fall back to OpenCode's configured shell; a supervisor
-that starts but cannot create/assign the real shell exits with code 125 rather
-than silently running outside the Job boundary. Set
-`supervisorEnabled: false` to disable or `supervisorPath` to use another build.
-`OPENCODE_REAL_BASH` is supplied internally to tool and PTY processes.
-
-The executable is named `bash.exe` so OpenCode keeps its Bash-specific argument
-and login-shell behavior. Interactive terminal invocations inherit their PTY
-stdio and launch the real Bash directly; private relay pipes and Job cleanup
-apply to non-interactive command execution.
-
-## Default timeout guard
-
-Commands that are neither **downloads** nor **builds** receive a default
-timeout when the agent omitted one:
-
-- if the command has no explicit `timeout`, it is set to the ceiling
-  (2 minutes by default);
-- any explicit positive `timeout` is preserved, including values above the
-  default;
-- download and build commands (`curl`, `wget`, `git clone`, `npm install`,
-  `npm run build`, `make`, `cargo build`, ...) are exempt and keep their
-  timeout untouched.
-
-This sets the `timeout` argument only, and never wraps, prefixes, or rewrites
-the command. Set `hardTimeoutMs: 0` to disable the feature entirely.
-
-## Detached start isolation fallback
-
-Commands like `start "" "app.exe"`, `cmd /c start ...`, and PowerShell
-`Start-Process` launch a **detached process** that inherits the bash tool's
-stdout/stderr pipe handles. OpenCode waits for that pipe to reach EOF, so even a
-command that returns immediately (e.g. `start "" "Docker Desktop.exe" && echo
-LAUNCHED`) hangs the session until the launched program exits.
-
-When the Windows supervisor is not active, the plugin appends a handle-isolating redirection to the leading detached-start
-segment — `>/dev/null 2>&1` on bash, `> $null 2>&1` on PowerShell — so the
-detached process inherits null handles instead of the tool pipe. The command
-still launches and runs in the background, and OpenCode returns immediately:
-
-```text
-start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" && echo LAUNCHED
-  -> start "" "C:/Program Files/Docker/Docker/Docker Desktop.exe" >/dev/null 2>&1 && echo LAUNCHED
-```
-
-Only a leading `start` / `cmd ... /c start` / `Start-Process` / `Start-Job` is
-rewritten; commands that already redirect (`>` / `<`) and non-detached commands
-(`npm start`, `docker start`, ...) are untouched. Set
-`detachedStartIsolation: false` to disable.
-
-## LLM reviewer setup
-
-Python 3 is required. The bundled auditor uses only the Python standard library
-and talks to any **OpenAI-compatible chat completions** endpoint.
-
-Configure the endpoint, model, and API key through environment variables:
-
-```dotenv
-# required
-API_KEY=your-api-key-here
-
-# optional, defaults shown for DeepSeek
-OPENAI_BASE_URL=https://api.deepseek.com/chat/completions
-OPENAI_MODEL=deepseek-v4-flash
-```
-
-The `API_KEY` variable is left for you to fill in. `DEEPSEEK_API_KEY` is also accepted,
-and both `API_KEY` and `DEEPSEEK_API_KEY` are read from `~/.env` as a fallback.
-Use `LLM_BASE_URL` / `LLM_MODEL` as aliases for the `OPENAI_*` variables.
-We suggest using offical DeepSeek provider + deepseeek-v4-flash for this classifier
-> **Provider note**: your provider must allow SDK/API calls with this key. Some
-> providers issue keys restricted to some specific coding clientsy; such
-> keys using in this case may result in ban.
-
-The reviewer is fixed to:
-
-- thinking: disabled
-- response format: JSON Object
-- temperature: `0`
-
-Review packages are bounded JSON sent to the auditor over stdin. Static `ALLOW`
-and `DENY` commands never reach the LLM. Static `ASK` requests include the exact
-command, any inspected local-script contents, bounded directory-entry names for
-inspected deletion targets, and the worktree/cwd as a tool boundary. The fixed
-reviewer policy repeats the recycle-bin override for inspected scripts and
-equivalent operations that the static classifier cannot prove: a pure move to the
-OS trash is always allowed, including for real project data, while emptying the
-trash is not.
-
-> Your provider&model must support JSON output in this case
-
-The reviewer is tool-enhanced:
-
-- the pre-supplied contents let it decide fast on common cases (1 round, 0 tool
-  calls in smoke tests);
-- when the context is insufficient, it inspects the filesystem through three
-  read-only tools the auditor executes locally — `read_file` (<=256 KB),
-  `list_directory` (<=200 entries), and `glob` (<=200 results) — restricted to
-  the project worktree plus `%LOCALAPPDATA%\Temp`; paths outside that boundary
-  are refused;
-- tool budget: prefer 1 round and at most 2 tool calls; hard limit 3 rounds and
-  6 tool calls total. It reads only key files relevant to the command and returns
-  as soon as confidence is high, keeping latency and cost bounded;
-- because the tools can obtain evidence, the reviewer no longer assumes a
-  good-faith ALLOW when context is missing: an uninspected script that a command
-  executes, or an uninspected deletion target, must be inspected with a tool
-  before an ALLOW. Tool results are treated as untrusted data; instructions
-  embedded in file contents are ignored;
-- a real-API smoke test (`test/smoke_review.py`) confirmed: ambiguous commands
-  ALLOW, project-shaped deletion with a listing DENY, temp deletion ALLOW,
-  prompt-injection inside a destructive command DENY, complex `&&`/`||` chains
-  inside temp ALLOW, and a destructive local script is DENY only after
-  `read_file` retrieves its contents (a fix for the previous good-faith gap).
-
-## Local installation
+## Installation
 
 Build the plugin:
 
@@ -278,89 +222,38 @@ Build the plugin:
 bun run build
 ```
 
-Reference the project directory from `opencode.json`:
+Reference the project directory from `opencode.json` as shown above, using `<absolute-path-to-plugin>` (the absolute path to the plugin folder on your machine). Restart OpenCode after changing plugin configuration or rebuilding.
 
-```json
-{
-  "plugin": [
-    "C:/Users/34177/AIGC/opencode-local-plugins/opencode-bash-classifier"
-  ]
-}
+## Windows process supervisor
+
+On Windows, OpenCode can keep waiting after a shell exits when a descendant inherits the stdout/stderr pipe. The optional native supervisor fixes that process boundary without changing the agent's command: the real shell starts suspended and enters a Windows Job Object before spawning descendants, inherits private relay pipes instead of OpenCode's pipe handles, and normal shell exit gets a bounded output drain that does not wait for a detached descendant.
+
+The real shell comes **only** from OpenCode's configured shell, injected through the `shell.env` hook as `OPENCODE_REAL_BASH`. There is intentionally **no** hard-coded fallback (e.g. `C:\msys64\usr\bin\bash.exe`) — the supervisor never silently targets the wrong shell. If `OPENCODE_REAL_BASH` is missing, the supervisor exits with status **125**. All run paths used by the plugin are configuration- or package-relative; there is no hard-coded machine path. The injection is scoped to the `shell.env` output and never pollutes the global `process.env`.
+
+Build it once before restarting OpenCode:
+
+```bash
+bun run build:supervisor
 ```
 
-Restart OpenCode after rebuilding.
+The release executable (`bash.exe`, named so OpenCode keeps Bash-specific argument behavior) is enabled automatically on Windows when it exists; set `supervisorEnabled: false` to disable or `supervisorPath` to point at another build.
 
-## Options
+## Security boundaries and limitations
 
-OpenCode supports plugin options using a tuple:
-
-```json
-{
-  "plugin": [
-    [
-      "C:/Users/34177/AIGC/opencode-local-plugins/opencode-bash-classifier",
-      {
-        "securityEnabled": true,
-        "cloudReviewEnabled": true,
-        "auditorTimeoutMs": 8000,
-        "hardTimeoutMs": 120000,
-        "detachedStartIsolation": true,
-        "supervisorEnabled": true
-      }
-    ]
-  ]
-}
-```
-
-- `securityEnabled`: enables the execution-boundary classifier; default `true`
-- `cloudReviewEnabled`: sends static `ASK` commands to the LLM reviewer; default `true`
-- `auditorTimeoutMs`: total Python reviewer timeout (tool rounds included); default `30000`
-- `hardTimeoutMs`: default timeout (ms) for non-download/build commands that do
-  not provide one; default `120000`; set `0` to disable
-- `detachedStartIsolation`: append handle isolation to `start`/`Start-Process`;
-  default `true`; used only when the supervisor is inactive
-- `supervisorEnabled`: use the native Windows shell supervisor when its
-  executable exists; default `true` on Windows
-- `supervisorPath`: explicit path to the supervisor `bash.exe`
-- `auditorPython`: explicit Python 3 executable
-- `auditorPath`: explicit path to `deepseek_auditor.py`
-- `shell`: optional real-shell override and classifier dialect hint
-
-## Security boundaries
-
-- This plugin is a defense-in-depth guardrail, not an OS sandbox.
-- Package hooks, build tools, test runners, interpreters, and trusted local
-  executables can execute arbitrary code.
-- Local scripts are inspected only inside the worktree, up to 256 KB per file
-  and eight candidates. At most 256,000 script characters are attached to one
-  review.
-- At most four deletion-target directories and 200 top-level entries per
-  directory are listed. File contents below those targets are not read.
-- A script or deletion target that cannot be inspected statically is reported to
-  the reviewer as uninspected; the reviewer then retrieves its contents with the
-  read-only tools before allowing the command, so missing static context is
-  resolved with evidence rather than assumption.
-- The reviewer's tools read only inside the project worktree plus
-  `%LOCALAPPDATA%\Temp`, up to 256 KB per file, 200 entries per listing, and 200
-  glob results, with a hard budget of 3 rounds and 6 tool calls per review.
-- Dynamic `DENY` results are never cached. Dynamic `ALLOW` results are not
-  cached when local scripts or deletion targets are uninspected, or when a
-  directory snapshot is truncated. The in-memory cache is bounded to 512
-  entries and disappears when OpenCode exits.
-- Backup matching is exact and case-sensitive at the directory-entry level.
-  Filesystems that do not expose a positive creation timestamp fail closed
-  instead of using modification time.
-- The Local Temp whitelist resolves the trusted root and the nearest existing
-  path ancestor before allowing an operation, preventing `..` and junction or
-  symlink escapes. Wildcards may select contents below the root but cannot
-  delete the root directory itself.
-- The native Bash permission system still runs after this plugin's hook.
-- OpenCode 1.18.5 does not expose an official per-tool TUI renderer extension.
-  Always-collapsed semantic Bash cards therefore require an OpenCode core change,
-  not a server plugin.
+- This plugin is a **defense-in-depth guardrail, not an OS sandbox**. It cannot contain a determined malicious payload.
+- Build, test, install, and package-management commands can and will execute project code and third-party scripts.
+- Static classification and LLM review both make mistakes; treat any `ALLOW` as a risk-reduced but not proven-safe decision.
+- With `fail_open`, a reviewer outage silently widens the policy to static-only — the most permissive unattended configuration.
+- The dynamic reviewer receives commands, paths, and local script contents; see the disclosure section above before enabling a third-party endpoint.
+- OpenCode's native permission system still runs after this plugin's hook and remains the final gate.
 
 ## Development
 
 ```bash
-bun run check
+bun run build          # build the plugin to ./dist
+bun run check          # build + unit tests + auditor Python tests
+bun run test:auditor   # Python tests for the auditor's read-only tools
+bun run test:supervisor  # native supervisor integration test (requires a built supervisor)
 ```
+
+Note: the `test/` directory is listed in `.gitignore`; already tracked tests remain in a clone, while any newly added test file must be force-added explicitly before commit. The supervisor integration test additionally requires a built supervisor binary.

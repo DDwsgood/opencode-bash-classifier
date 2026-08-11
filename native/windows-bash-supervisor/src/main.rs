@@ -394,8 +394,12 @@ mod windows {
     }
 
     pub fn run() -> Result<i32, String> {
+        // The real Bash executable must be supplied by the caller via
+        // OPENCODE_REAL_BASH; there is intentionally no machine-specific fallback so
+        // the supervisor never silently targets the wrong shell. A missing value
+        // is reported here and the existing main() flow exits with status 125.
         let real_bash = env::var_os("OPENCODE_REAL_BASH")
-            .unwrap_or_else(|| OsString::from(r"C:\msys64\usr\bin\bash.exe"));
+            .ok_or_else(|| String::from("OPENCODE_REAL_BASH is not set; cannot locate the real Bash executable"))?;
         let arguments: Vec<OsString> = env::args_os().skip(1).collect();
         if is_interactive_invocation(&arguments) {
             return run_interactive(&real_bash, &arguments);

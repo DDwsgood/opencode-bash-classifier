@@ -18,8 +18,11 @@ node native/windows-bash-supervisor/test/integration.mjs \
   native/windows-bash-supervisor/target/release/bash.exe
 ```
 
-Set `OPENCODE_REAL_BASH` to override the default
-`C:\msys64\usr\bin\bash.exe`.
+`OPENCODE_REAL_BASH` is mandatory: the plugin injects the configured real
+shell through the `shell.env` hook as this variable. It is not an override of
+a default, and there is intentionally no `C:\msys64\usr\bin\bash.exe`
+fallback — the supervisor never silently targets the wrong shell. If
+`OPENCODE_REAL_BASH` is missing, the supervisor exits with status **125**.
 
 The integration test checks direct argument and `shell:` invocation,
 exit-code/output passthrough, concurrent large stdout/stderr, reproduces an

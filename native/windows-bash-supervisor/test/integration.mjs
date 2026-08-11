@@ -7,7 +7,12 @@ import path from "node:path"
 const executable = process.argv[2]
 if (!executable) throw new Error("usage: node test/integration.mjs <supervisor.exe>")
 
-const realBash = process.env.OPENCODE_REAL_BASH || "C:/msys64/usr/bin/bash.exe"
+// The caller must point at the real Bash executable; no machine-specific default
+// is permitted so the test never accidentally exercises a foreign shell.
+const realBash = process.env.OPENCODE_REAL_BASH
+if (!realBash) {
+  throw new Error("OPENCODE_REAL_BASH must be set to the real Bash executable path before running the integration test")
+}
 const environment = { ...process.env, OPENCODE_REAL_BASH: realBash }
 
 function run(file, args, options = {}) {
