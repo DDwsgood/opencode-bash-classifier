@@ -432,7 +432,7 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     strictness = source.strictness
   }
 
-  let failPolicy: FailPolicy = "fail_ask"
+  let failPolicy: FailPolicy = "fail_open"
   if (source.failPolicy !== undefined) {
     if (
       source.failPolicy !== "fail_ask" &&

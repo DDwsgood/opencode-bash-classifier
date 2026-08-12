@@ -36,7 +36,7 @@ describe("resolvePluginConfig defaults", () => {
     expect(config.detachedStartIsolation).toBe(true)
     expect(config.hardTimeoutMs).toBe(120_000)
     expect(config.strictness).toBe("LOOSE")
-    expect(config.failPolicy).toBe("fail_ask")
+    expect(config.failPolicy).toBe("fail_open")
     expect(config.shell).toBeUndefined()
     expect(config.reviewCommand).toBeUndefined()
     expect(config.dynamicReview.available).toBe(false)

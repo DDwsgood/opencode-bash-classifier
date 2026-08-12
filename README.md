@@ -2,11 +2,11 @@
 
 [简体中文](README.zh-CN.md)
 
-Version 0.4.0 — an execution-boundary command safety classifier for OpenCode's native `bash` tool.
+Version 0.4.2 — an execution-boundary command safety classifier for OpenCode's native `bash` tool.
 
 ## Overview
 
-The plugin leaves OpenCode's native Bash tool untouched and classifies every command **before** it runs by registering `tool.execute.before` / `tool.execute.after` hooks. Classification is **static-first**: a fast local classifier reviews each command, and only commands it cannot prove safe (`ASK`) — or commands forced into review by a previous rejection or failure — are sent to the optional dynamic OpenAI-compatible reviewer. That design is what keeps dynamic requests rare; the exact reduction depends on the workload, so no fixed percentage is promised.
+The plugin leaves OpenCode's native Bash tool untouched and classifies every command **before** it runs by registering `tool.execute.before` / `tool.execute.after` hooks. Classification is **static-first**: a fast local classifier reviews each command, and only commands it cannot prove safe (`ASK`) — or commands forced into review by a previous rejection or failure in HARD mode — are sent to the optional dynamic OpenAI-compatible reviewer. That design is what keeps dynamic requests rare; the exact reduction depends on the workload, so no fixed percentage is promised.
 
 The plugin exposes **two user policies**, `LOOSE` and `HARD`. The policy label and the `strictness` value are never sent to the model: the bundled auditor selects an **independent system prompt** for each policy and sends only that prompt together with the review data. Block messages likewise never reveal which policy is active.
 
@@ -21,8 +21,66 @@ native Bash request
        DENY  -> blocked
        ASK or forced context -> dynamic LLM reviewer (tool-enhanced, OpenAI-compatible)
                   ALLOW -> OpenCode native Bash
-                  DENY  -> blocked (HARD: bypass attempts also abort the session)
+                   DENY  -> blocked (HARD: bypass attempts also abort the session)
 ```
+
+## Installation
+
+### Option 1: let an agent install it (recommended)
+
+In OpenCode, just ask the agent:
+
+> Help me install and configure opencode-bash-classifier (帮我安装并配置opencode-bash-classifier)
+
+The agent performs the installation, writes the `plugin` configuration, and walks you through the optional dynamic reviewer setup.
+
+### Option 2: npm package
+
+Reference the npm package name directly in the `plugin` array of `opencode.json` — OpenCode installs it from npm automatically, no manual global install needed:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "opencode-bash-classifier",
+      {
+        "strictness": "HARD",
+        "failPolicy": "fail_open"
+      }
+    ]
+  ]
+}
+```
+
+### Option 3: clone and build locally
+
+```bash
+git clone https://github.com/DDwsgood/opencode-bash-classifier.git
+cd opencode-bash-classifier
+bun install
+bun run build
+```
+
+Then reference the plugin folder by its absolute path in `opencode.json`:
+
+```json
+{
+  "plugin": [
+    [
+      "<absolute-path-to-plugin>",
+      {
+        "strictness": "HARD",
+        "failPolicy": "fail_open"
+      }
+    ]
+  ]
+}
+```
+
+`<absolute-path-to-plugin>` is the absolute path to the plugin folder on your machine. For a local install that also wants the Windows process supervisor, run `bun run build:supervisor` once before restarting (see below).
+
+All three options require **restarting OpenCode** after installation or configuration changes. See [Configuration](#configuration) for the full option list. Without a `dynamicReview` block the dynamic reviewer is unavailable and the [`failPolicy`](#fail-policy) takes over — if you do not want a dynamic reviewer, `HARD + fail_open` is the recommended combination.
 
 ## Static classification
 
@@ -41,15 +99,15 @@ LOOSE assumes a well-intentioned developer and exists to prevent accidental, irr
 - **Backups**: a backup name (`.backup`, `-backup`, `.bak`, `-bak`, optionally followed by digits) may be created only by copying; moving/renaming into a backup name is denied. Permanent backup deletion is allowed only for a standalone, verified target where an exact same-directory original exists, filesystem types match, and the backup is older than two minutes.
 - **Data files**: deleting `.csv`, `.json`, `.yaml`, `.db`, `.sqlite`, `.xlsx`, `.pdf`, and similar durable files is not statically denied — it becomes at least `ASK` and is evaluated on concrete scope and directory contents. Permanent deletion of critical credential material — `.env`, `.pem`, `.key`, `.p12`, and similar private-key files — is statically `DENY`.
 - **Recycle bin**: a real, pure move to the OS trash/recycle bin is allowed, even for project-looking targets; emptying, purging, or directly deleting items inside the recycle bin is denied.
-- **Normal work**: common test runners, builds, package installs, read-only inspection commands, git local operations, and narrowly scoped cleanup of disposable targets (`node_modules`, `dist`, `build`, `coverage`, caches) are statically allowed.
+- **Normal work**: common test runners, builds, package installs, read-only inspection commands, everyday git operations (including non-forced `push`/`pull`/`switch`/`merge`; force pushes still require review), and narrowly scoped cleanup of disposable targets (`node_modules`, `dist`, `build`, `coverage`, caches) are statically allowed.
 - **Local scripts**: local scripts inside the worktree are read (up to 256 KB each, up to 8), fingerprinted, and scanned for delete/kill/write primitives. A script that was fully read, fingerprinted, and contains no review-requiring behavior is statically allowed; a script containing `rm`, `pkill`, writes, or similar primitives sends the command to dynamic review.
-- **Dynamic ALLOW cache**: successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) so an identical command is not re-sent; the cache only applies in LOOSE mode, is skipped when the review was forced by a previous failure or the static context is not fully inspectable, and dynamic `DENY` is never cached.
+- **Dynamic ALLOW cache**: successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) so an identical command is not re-sent; the cache only applies in LOOSE mode, is skipped when the static context is not fully inspectable, and dynamic `DENY` is never cached.
 
 ### HARD — strictest, no relaxations
 
 - All forced recursive deletions (`rm -rf`, `Remove-Item -Recurse -Force`, and equivalent flag combinations) are statically `DENY`.
 - There is **no** temp/tmp, Local Temp, or backup exception in HARD mode; deleting any named temp, Local Temp, or backup target is denied.
-- Permanently deleting **or moving to the recycle bin** a durable data file is denied; other genuine recycle-bin moves are at least `ASK`.
+- Permanently deleting **or moving to the recycle bin** a durable data file is denied; other genuine recycle-bin moves are statically allowed — moving an item to the OS recycle bin is recoverable and no longer consumes a dynamic review.
 - Emptying, purging, or directly deleting items inside the recycle bin is denied.
 - No caching of dynamic `ALLOW` results.
 - After **any** rejection, the next bash command is forced through dynamic review with the previous rejection attached as context; the reviewer must return `{decision, reason, bypassing}`, and a detected bypass (`bypassing: true`) blocks the command and best-effort aborts the session via `session.abort`.
@@ -138,17 +196,18 @@ When the reviewer is unconfigured, unavailable, times out, or returns an invalid
 
 | Policy | Meaning |
 |---|---|
-| `fail_ask` (default) | Human-in-the-loop: the command is blocked and a `bash_classifier_confirm` tool is offered to request user approval. |
+| `fail_open` (default) | Let the command proceed. |
 | `fail_close` | Block the command. |
-| `fail_open` | Let the command proceed. |
+| `fail_ask` | Human-in-the-loop: the command is blocked and a `bash_classifier_confirm` tool is offered to request user approval. |
 
-The three combinations to remember:
+Recommended combinations:
 
-- **HARD + `fail_close`** is the strictest unattended configuration.
-- **LOOSE + `fail_ask`** is the human-in-the-loop configuration with the broadest good-faith behavior while a human can still veto.
-- **LOOSE + `fail_open`** is the most permissive unattended configuration **and the riskiest**: a reviewer outage silently disables the semantic layer, leaving only the static classifier. Use only if you accept that risk.
+- **No dynamic reviewer**: use **HARD + `fail_open`** — every strict static `DENY` still applies, `ASK` commands proceed while the reviewer is absent, and the agent is never interrupted.
+- **`fail_ask` is not recommended**: every reviewer outage or failure turns a questionable command into a manual confirmation, which heavily disrupts agent activity. Choose it only when you truly need a human veto on every questionable command.
+- **HARD + `fail_close`** is the strictest unattended configuration: every `ASK` command is blocked while the reviewer is absent.
+- **LOOSE + `fail_open`** is the most permissive unattended configuration: a reviewer outage silently disables the semantic layer, leaving only the static classifier. Use only if you accept that risk.
 
-The default is `fail_ask`, not `fail_open`.
+The default is `fail_open`.
 
 ### Human approval (`fail_ask`)
 
@@ -157,9 +216,9 @@ Because a `before` hook cannot create a native permission prompt itself, the plu
 ### Rejection / failure escalation (session-scoped)
 
 - **HARD only**: after **any** static, dynamic, or policy rejection, the next bash command in the session is forced through dynamic review regardless of its static result, with the previous rejection attached as context. The reviewer must return `{decision, reason, bypassing}`; if it judges the new command to be a bypass (`bypassing: true`), the command is blocked and the session is aborted via `session.abort`. LOOSE never records rejections and performs no bypass detection.
-- **Both modes**: after a bash command **exits non-zero**, the next execution of a local script in that session is forced through dynamic review with the failure context (command, exit code, bounded output tail) attached. An ordinary successful command does not clear a pending failure; only the forced review run that consumed it does.
+- **HARD only**: after a bash command **exits non-zero**, the **next** bash command in that session is forced through dynamic review with the failure context (command, exit code, bounded output tail) attached: a static `ALLOW` or `ASK` result is always handed to the reviewer, while a static `DENY` stays a static block and does not consume the failure record. An ordinary successful command does not clear a pending failure; only the forced review run that consumed it does. LOOSE never records failures and performs no failure escalation.
 - All state (`lastRejected`, `lastFailed`, pending approvals, allow-cache) is per-session, expires after **30 minutes**, is bounded to **512 sessions**, and is discarded immediately when the session is deleted (`session.deleted`).
-- Successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) only in LOOSE mode when the static context is fully inspectable and the review was not failure-forced; dynamic `DENY` is never cached.
+- Successful dynamic `ALLOW` results may be cached for 30 minutes (bounded to 512 entries) only in LOOSE mode when the static context is fully inspectable; dynamic `DENY` is never cached.
 
 ## Configuration
 
@@ -170,10 +229,10 @@ Options live in the OpenCode `plugin` tuple:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "<absolute-path-to-plugin>",
+      "opencode-bash-classifier",
       {
         "strictness": "LOOSE",
-        "failPolicy": "fail_ask",
+        "failPolicy": "fail_open",
         "dynamicReview": {
           "baseURL": "https://api.example.com/v1",
           "model": "your-model-id",
@@ -190,14 +249,14 @@ Options live in the OpenCode `plugin` tuple:
 }
 ```
 
-`<absolute-path-to-plugin>` is the absolute path to the plugin folder. `pythonPath` may be a bare interpreter name (resolved through PATH at spawn time) or a package-relative path to an existing interpreter; `auditorPath` resolves against the package root. Restart OpenCode after changing any of these options.
+The first tuple element is the npm package name (installed automatically); for a local clone install, use the absolute path to the plugin folder instead. `pythonPath` may be a bare interpreter name (resolved through PATH at spawn time) or a package-relative path to an existing interpreter; `auditorPath` resolves against the package root. Restart OpenCode after changing any of these options.
 
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `shell` | string | OpenCode's shell | Real-shell override; also the classifier's dialect hint. |
 | `securityEnabled` | boolean | `true` | Enable the classifier hooks entirely. |
 | `strictness` | `"LOOSE" \| "HARD"` | `"LOOSE"` | Selects the static ruleset and the dynamic system prompt. |
-| `failPolicy` | `"fail_ask" \| "fail_open" \| "fail_close"` | `"fail_ask"` | Behavior when the reviewer is unavailable or fails. |
+| `failPolicy` | `"fail_ask" \| "fail_open" \| "fail_close"` | `"fail_open"` | Behavior when the reviewer is unavailable or fails. |
 | `dynamicReview.baseURL` | string | — | OpenAI-compatible base URL (`/chat/completions` is appended). HTTP only for loopback hosts; remote endpoints must use HTTPS. |
 | `dynamicReview.model` | string | — | Model ID. |
 | `dynamicReview.apiKey` | string | — | API key (exactly one of `apiKey` / `apiKeyEnv`). |
@@ -213,16 +272,6 @@ Options live in the OpenCode `plugin` tuple:
 | `supervisorPath` | string | package default | Path to the supervisor `bash.exe`. |
 
 The plugin also supports `reviewCommand` for programmatic test injection only; it is never wired by the plugin itself.
-
-## Installation
-
-Build the plugin:
-
-```bash
-bun run build
-```
-
-Reference the project directory from `opencode.json` as shown above, using `<absolute-path-to-plugin>` (the absolute path to the plugin folder on your machine). Restart OpenCode after changing plugin configuration or rebuilding.
 
 ## Windows process supervisor
 
@@ -243,7 +292,7 @@ The release executable (`bash.exe`, named so OpenCode keeps Bash-specific argume
 - This plugin is a **defense-in-depth guardrail, not an OS sandbox**. It cannot contain a determined malicious payload.
 - Build, test, install, and package-management commands can and will execute project code and third-party scripts.
 - Static classification and LLM review both make mistakes; treat any `ALLOW` as a risk-reduced but not proven-safe decision.
-- With `fail_open`, a reviewer outage silently widens the policy to static-only — the most permissive unattended configuration.
+- With `fail_open` (the current default), a reviewer outage silently widens the policy to static-only — the most permissive unattended posture.
 - The dynamic reviewer receives commands, paths, and local script contents; see the disclosure section above before enabling a third-party endpoint.
 - OpenCode's native permission system still runs after this plugin's hook and remains the final gate.
 

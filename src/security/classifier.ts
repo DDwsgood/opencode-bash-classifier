@@ -343,7 +343,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       /\bgit\s+clean\b[^\n]*(?:-[a-z]*f[a-z]*d[a-z]*x|-[a-z]*x[a-z]*d[a-z]*f)\b/i.test(text) ||
       /\bgit\s+reset\s+--hard\b/i.test(text) ||
       /\bgit\s+(?:checkout|restore)\s+--?\s*(?:\.|\*)\b/i.test(text) ||
-      /\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?|-f)\b/i.test(text),
+      /\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b)/i.test(text),
   },
   {
     id: "execution.remote-pipe",
@@ -1697,7 +1697,12 @@ function isKnownSafeSegment(segment: string) {
   if (/^(?:rg|grep|Select-String)\b/i.test(value)) return true
   if (/^find\b/i.test(value)) return !/(?:^|\s)-(?:delete|exec|execdir|ok|okdir)(?:\s|$)/i.test(value)
   if (/^git\s+(?:status|diff|log|show|rev-parse|ls-files|grep|remote\s+-v|add|commit)\b/i.test(value)) return true
-  if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+)\b/i.test(value)) return true
+  if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+|pull|switch|merge)\b/i.test(value)) return true
+  if (
+    /^git\s+push\b(?![\s\S]*(?:\s--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b))/i.test(value)
+  ) {
+    return true
+  }
   if (/^(?:mkdir|New-Item\s+[^\n]*-ItemType\s+Directory)\b/i.test(value)) return true
   if (/^(?:tar\s+-[a-z]*c[a-z]*f|zip\s+-r)\b/i.test(value)) return !/--remove-files\b/i.test(value)
   if (/^(?:cp|copy|Copy-Item)\b/i.test(value)) return false
@@ -2371,9 +2376,9 @@ async function classifySegment(
         }
       }
       return {
-        verdict: "ASK",
+        verdict: "ALLOW",
         rules: ["filesystem.recycle-bin"],
-        reason: "Moving this item to the recycle bin requires review",
+        reason: "Moves items to the recoverable operating-system recycle bin",
       }
     }
     return {

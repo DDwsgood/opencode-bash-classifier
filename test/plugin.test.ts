@@ -440,7 +440,7 @@ describe("OpenCode native Bash security hook", () => {
     expect(reviews).toBe(1)
   })
 
-  test("dynamic review unavailable with invalid config falls back to fail_ask by default", async () => {
+  test("dynamic review unavailable with invalid config falls back to fail_open by default", async () => {
     const { hook } = await beforeHook({
       dynamicReview: {
         baseURL: "not a url",
@@ -448,16 +448,12 @@ describe("OpenCode native Bash security hook", () => {
         apiKey: "sk-test-key",
       },
     })
-    await expect(invoke(hook, "custom-project-command --repair")).rejects.toThrow(
-      /bash_classifier_confirm/,
-    )
+    await invoke(hook, "custom-project-command --repair")
   })
 
-  test("default fail_ask blocks when no reviewer is configured", async () => {
+  test("default fail_open allows when no reviewer is configured", async () => {
     const { hook } = await beforeHook()
-    await expect(invoke(hook, "custom-project-command --repair")).rejects.toThrow(
-      /bash_classifier_confirm/,
-    )
+    await invoke(hook, "custom-project-command --repair")
   })
 
   test("fail_open allows when reviewer is unavailable", async () => {
@@ -636,9 +632,10 @@ describe("OpenCode native Bash security hook", () => {
   test("exit!=0 forces script re-review on next local script execution", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
       reviewCommand: async (req: CloudReviewRequest) => {
         reviewed.push(req)
-        return ALLOW
+        return STRICT_ALLOW
       },
     })
     await hooks["tool.execute.after"]?.(
@@ -651,7 +648,7 @@ describe("OpenCode native Bash security hook", () => {
     expect(reviewed[0]?.previousFailedCommand?.exitCode).toBe(1)
   })
 
-  test("exit!=0 does not force re-review for non-script commands", async () => {
+  test("exit!=0 does not force re-review for non-script commands in LOOSE", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
       reviewCommand: async (req: CloudReviewRequest) => {
@@ -667,12 +664,73 @@ describe("OpenCode native Bash security hook", () => {
     expect(reviewed).toHaveLength(0)
   })
 
-  test("ordinary success does not clear failed script context", async () => {
+  test("HARD exit!=0 forces re-review for any next command including non-scripts", async () => {
+    const reviewed: CloudReviewRequest[] = []
+    const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
+      reviewCommand: async (req: CloudReviewRequest) => {
+        reviewed.push(req)
+        return STRICT_ALLOW
+      },
+    })
+    await hooks["tool.execute.after"]?.(
+      { tool: "bash", sessionID: "s1", callID: "c1", args: { command: "failing-cmd" } },
+      { title: "", output: "error", metadata: { exit: 1 } },
+    )
+    await invoke(hook, "ls -la", undefined, "bash", "s1")
+    expect(reviewed).toHaveLength(1)
+    expect(reviewed[0]?.previousFailedCommand?.command).toBe("failing-cmd")
+    expect(reviewed[0]?.previousFailedCommand?.exitCode).toBe(1)
+  })
+
+  test("LOOSE exit!=0 never attaches failure context to the next local script execution", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
       reviewCommand: async (req: CloudReviewRequest) => {
         reviewed.push(req)
         return ALLOW
+      },
+    })
+    await hooks["tool.execute.after"]?.(
+      { tool: "bash", sessionID: "s1", callID: "c1", args: { command: "python ./failed.py" } },
+      { title: "", output: "error", metadata: { exit: 1 } },
+    )
+    await invoke(hook, "python ./test/fixtures/safe_agent_script.py", undefined, "bash", "s1")
+    // The local script is still reviewed on its own merits (static ASK), but LOOSE
+    // never records lastFailed, so no previousFailedCommand context is attached.
+    expect(reviewed).toHaveLength(1)
+    expect(reviewed[0]?.previousFailedCommand).toBeUndefined()
+  })
+
+  test("HARD exit!=0 keeps static DENY without consuming the failure record", async () => {
+    const reviewed: CloudReviewRequest[] = []
+    const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
+      reviewCommand: async (req: CloudReviewRequest) => {
+        reviewed.push(req)
+        return STRICT_ALLOW
+      },
+    })
+    await hooks["tool.execute.after"]?.(
+      { tool: "bash", sessionID: "s1", callID: "c1", args: { command: "failing-cmd" } },
+      { title: "", output: "error", metadata: { exit: 1 } },
+    )
+    await expect(invoke(hook, "rm -rf ./some-dir", undefined, "bash", "s1")).rejects.toThrow(
+      "Blocked by static classifier",
+    )
+    expect(reviewed).toHaveLength(0)
+    await invoke(hook, "ls -la", undefined, "bash", "s1")
+    expect(reviewed).toHaveLength(1)
+    expect(reviewed[0]?.previousFailedCommand?.command).toBe("failing-cmd")
+  })
+
+  test("ordinary success does not clear failed script context", async () => {
+    const reviewed: CloudReviewRequest[] = []
+    const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
+      reviewCommand: async (req: CloudReviewRequest) => {
+        reviewed.push(req)
+        return STRICT_ALLOW
       },
     })
     await hooks["tool.execute.after"]?.(
@@ -691,9 +749,10 @@ describe("OpenCode native Bash security hook", () => {
   test("exitCode field is compatible with exit", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
       reviewCommand: async (req: CloudReviewRequest) => {
         reviewed.push(req)
-        return ALLOW
+        return STRICT_ALLOW
       },
     })
     await hooks["tool.execute.after"]?.(
@@ -707,9 +766,10 @@ describe("OpenCode native Bash security hook", () => {
   test("failed command state does not chain across sessions", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
       reviewCommand: async (req: CloudReviewRequest) => {
         reviewed.push(req)
-        return ALLOW
+        return STRICT_ALLOW
       },
     })
     await hooks["tool.execute.after"]?.(
@@ -1202,9 +1262,10 @@ describe("OpenCode native Bash security hook", () => {
   test("successful reviewed script consumes only its claimed failure generation", async () => {
     const reviewed: CloudReviewRequest[] = []
     const { hook, hooks } = await beforeHook({
+      strictness: "HARD",
       reviewCommand: async (request: CloudReviewRequest) => {
         reviewed.push(request)
-        return ALLOW
+        return STRICT_ALLOW
       },
     })
     await hooks["tool.execute.after"]?.(

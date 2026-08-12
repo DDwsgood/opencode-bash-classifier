@@ -749,12 +749,16 @@ describe("static command security classifier", () => {
       "git stash push",
       "git branch feature-branch",
       "git tag v1.0.0",
+      "git push origin main",
+      "git push",
+      "git pull",
+      "git switch main",
+      "git merge feature",
     ]
-    for (const script of allowed) expect(await verdict(script)).toBe("ALLOW")
+    for (const script of allowed) expect(await verdict(script), script).toBe("ALLOW")
+    for (const script of allowed) expect(await verdictHard(script), script).toBe("ALLOW")
 
     const asked = [
-      "git push",
-      "git merge feature",
       "git rebase main",
       "git checkout -- file.txt",
       "git stash drop",
@@ -762,8 +766,18 @@ describe("static command security classifier", () => {
       "git reset --hard",
       "git clean -fdx",
       "git push --force",
+      "git push --force origin main",
+      "git push -f origin main",
+      "git push -uf origin main",
+      "git push --force-with-lease origin main",
     ]
-    for (const script of asked) expect(await verdict(script)).toBe("ASK")
+    for (const script of asked) expect(await verdict(script), script).toBe("ASK")
+    for (const script of asked) expect(await verdictHard(script), script).toBe("ASK")
+
+    const forcedSignal = await decision("git push -uf origin main")
+    expect(forcedSignal.rules).toContain("git.irrecoverable-change")
+    expect((await decision("git push --force")).rules).toContain("git.irrecoverable-change")
+    expect((await decision("git push -f origin main")).rules).toContain("git.irrecoverable-change")
   })
 
   test("allows harmless redirects to /dev/null and $null", async () => {
@@ -811,9 +825,9 @@ describe("static command security classifier", () => {
 
   test("HARD recycle-bin handling matches non-recursive deletion sensitivity", async () => {
     const recycle = await decisionHard("trash-put ./project")
-    expect(recycle.verdict).toBe("ASK")
+    expect(recycle.verdict).toBe("ALLOW")
     expect(recycle.rules).toContain("filesystem.recycle-bin")
-    expect(await verdictHard("trash file.txt")).toBe("ASK")
+    expect(await verdictHard("trash file.txt")).toBe("ALLOW")
     expect(await verdictHard("trash data.csv")).toBe("DENY")
     expect(await verdictHard("trash api-key.env")).toBe("DENY")
     expect(await verdictHard("trash backup.bak")).toBe("DENY")
@@ -1332,7 +1346,7 @@ describe("classifier refactor security semantics", () => {
       expect(await verdict(`rm -f data.${extension}`), extension).toBe("ASK")
       expect(await verdict(`trash-put data.${extension}`), extension).toBe("ALLOW")
     }
-    expect(await verdictHard("trash-put notes.txt")).toBe("ASK")
+    expect(await verdictHard("trash-put notes.txt")).toBe("ALLOW")
   })
 
   test("does not grant recycle-bin allowance to path-shadowed or local module commands", async () => {

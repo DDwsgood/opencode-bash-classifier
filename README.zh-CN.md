@@ -2,11 +2,11 @@
 
 [English](README.md)
 
-0.4.0 版本——面向 OpenCode 原生 `bash` 工具的“执行边界”命令安全分类器。
+0.4.2 版本——面向 OpenCode 原生 `bash` 工具的“执行边界”命令安全分类器。
 
 ## 概述
 
-本插件不触碰 OpenCode 的原生 Bash 工具，而是通过注册 `tool.execute.before` / `tool.execute.after` 钩子在每条命令**运行之前**对其分类。分类是**静态优先**的：快速的本机静态分类器先审查每条命令，只有它无法证明安全的命令（`ASK`）——或由于此前的拒绝/失败而被强制进入审查的命令——才会被发送给可选的动态 OpenAI-compatible 审阅器。正是这种设计让动态请求保持稀少；具体降幅取决于工作负载，因此这里不承诺任何固定百分比。
+本插件不触碰 OpenCode 的原生 Bash 工具，而是通过注册 `tool.execute.before` / `tool.execute.after` 钩子在每条命令**运行之前**对其分类。分类是**静态优先**的：快速的本机静态分类器先审查每条命令，只有它无法证明安全的命令（`ASK`）——或在 HARD 模式下由于此前的拒绝/失败而被强制进入审查的命令——才会被发送给可选的动态 OpenAI-compatible 审阅器。正是这种设计让动态请求保持稀少；具体降幅取决于工作负载，因此这里不承诺任何固定百分比。
 
 插件提供**两种用户策略**：`LOOSE` 和 `HARD`。策略标签和 `strictness` 值从不发送给模型：随附的审计器为每种策略选择**独立的 system prompt**，只把该提示连同审查数据一起发送。拦截消息同样从不暴露当前启用的是哪种策略。
 
@@ -21,8 +21,66 @@ native Bash request
        DENY  -> blocked
        ASK or forced context -> dynamic LLM reviewer (tool-enhanced, OpenAI-compatible)
                   ALLOW -> OpenCode native Bash
-                  DENY  -> blocked (HARD: bypass attempts also abort the session)
+                   DENY  -> blocked (HARD: bypass attempts also abort the session)
 ```
+
+## 安装
+
+### 方式一：让 Agent 帮忙安装（推荐）
+
+在 OpenCode 中直接对 agent 说：
+
+> 帮我安装并配置 opencode-bash-classifier
+
+agent 会完成安装、写入 `plugin` 配置，并按需引导你配置可选的动态审阅器。
+
+### 方式二：NPM 包
+
+在 `opencode.json` 的 `plugin` 数组中直接引用 npm 包名——OpenCode 会自动从 npm 安装该包，无需手动全局安装：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    [
+      "opencode-bash-classifier",
+      {
+        "strictness": "HARD",
+        "failPolicy": "fail_open"
+      }
+    ]
+  ]
+}
+```
+
+### 方式三：Clone 本地安装
+
+```bash
+git clone https://github.com/DDwsgood/opencode-bash-classifier.git
+cd opencode-bash-classifier
+bun install
+bun run build
+```
+
+然后在 `opencode.json` 中用插件文件夹的绝对路径引用：
+
+```json
+{
+  "plugin": [
+    [
+      "<absolute-path-to-plugin>",
+      {
+        "strictness": "HARD",
+        "failPolicy": "fail_open"
+      }
+    ]
+  ]
+}
+```
+
+`<absolute-path-to-plugin>` 是本机上插件文件夹的绝对路径。本地安装如需 Windows 进程监督器，在重启前再执行一次 `bun run build:supervisor`（见后文）。
+
+三种方式安装或修改配置后都需要**重启 OpenCode**。完整选项见[配置](#配置)一章；不配置 `dynamicReview` 时动态审阅器不可用，由 [`failPolicy`](#失败策略) 接管——不想用动态审阅器时推荐 `HARD + fail_open`。
 
 ## 静态分类
 
@@ -41,15 +99,15 @@ LOOSE 假定使用者是一位善意的开发者，其目标是防止持久化�
 - **备份**：备份名称（`.backup`、`-backup`、`.bak`、`-bak`，可后跟数字）只能通过复制创建；移动/重命名为备份名称会被拒绝。永久删除备份仅对独立、已验证的目标放行，要求同一目录下存在完全同名的原文件、文件系统类型匹配，且备份的创建时间早于两分钟。
 - **数据文件**：删除 `.csv`、`.json`、`.yaml`、`.db`、`.sqlite`、`.xlsx`、`.pdf` 及类似的持久化文件不会被静态拒绝——它至少会变成 `ASK`，并基于具体的范围和目录内容进行评估。永久删除关键凭据材料——`.env`、`.pem`、`.key`、`.p12` 及类似的私钥文件——会被静态 `DENY`。
 - **回收站**：真正纯粹的、把条目移入操作系统回收站/废纸篓的可恢复操作会被放行，即使目标是项目样式的文件；清空回收站、彻底删除（purge）或直接删除回收站内部条目则会被拒绝。
-- **日常工作**：常见的测试运行器、构建、包安装、只读检查命令、git 本地操作，以及对可丢弃目标（`node_modules`、`dist`、`build`、`coverage`、缓存）的受限清理都会被静态放行。
+- **日常工作**：常见的测试运行器、构建、包安装、只读检查命令、git 日常操作（含非强制的 `push`/`pull`/`switch`/`merge`；强制推送仍需审查），以及对可丢弃目标（`node_modules`、`dist`、`build`、`coverage`、缓存）的受限清理都会被静态放行。
 - **本地脚本**：工作树内的本地脚本会被读取（每个最多 256 KB，最多 8 个）、计算指纹并扫描其中的删除/杀死/写入原语。一个被完整读取、已计算指纹且不包含任何需要审查的行为的脚本会被静态放行；而包含 `rm`、`pkill`、写入等原语的脚本会把命令送往动态审查。
-- **动态 ALLOW 缓存**：成功的动态 `ALLOW` 结果可缓存 30 分钟（上限 512 条），使完全相同的命令不会再次发送；该缓存仅在 LOOSE 模式下生效，当审查由先前的失败强制触发或静态上下文无法完全检查时会跳过，动态 `DENY` 从不缓存。
+- **动态 ALLOW 缓存**：成功的动态 `ALLOW` 结果可缓存 30 分钟（上限 512 条），使完全相同的命令不会再次发送；该缓存仅在 LOOSE 模式下生效，当静态上下文无法完全检查时会跳过，动态 `DENY` 从不缓存。
 
 ### HARD —— 最严格，无任何放宽
 
 - 所有强制递归删除（`rm -rf`、`Remove-Item -Recurse -Force` 及等价的标志组合）都会被静态 `DENY`。
 - HARD 模式下**没有** temp/tmp、本地临时目录或备份例外；删除任何指定名称的临时目录、本地临时目录或备份目标都会被拒绝。
-- 持久化数据文件的永久删除**或移入回收站**都会被拒绝；其他真实的回收站移动操作至少是 `ASK`。
+- 持久化数据文件的永久删除**或移入回收站**都会被拒绝；其余真实的回收站移动会被静态放行——移入操作系统回收站是可恢复操作，无需再占用动态审查。
 - 清空回收站、彻底删除或直接删除回收站内部条目会被拒绝。
 - 不缓存动态 `ALLOW` 结果。
 - 发生**任何**拒绝之后，下一条 bash 命令都会被强制进入动态审查，并附带上一次拒绝作为上下文；审阅器必须返回 `{decision, reason, bypassing}`，一旦检测到绕过（`bypassing: true`），命令会被拦截，并会通过 `session.abort` 尽力中止会话。
@@ -138,17 +196,18 @@ API 密钥本身**仅**在发送给所配置端点的请求的 `Authorization` �
 
 | 策略 | 含义 |
 |---|---|
-| `fail_ask`（默认） | 人机协同：命令被拦截，并提供一个 `bash_classifier_confirm` 工具用于请求用户批准。 |
+| `fail_open`（默认） | 放行命令。 |
 | `fail_close` | 拦截命令。 |
-| `fail_open` | 放行命令。 |
+| `fail_ask` | 人机协同：命令被拦截，并提供一个 `bash_classifier_confirm` 工具用于请求用户批准。 |
 
-需要记住的三种组合：
+组合建议：
 
-- **HARD + `fail_close`** 是最严格的无人工值守配置。
-- **LOOSE + `fail_ask`** 是人机协同配置，既保留最宽的善意行为，人类仍可行使否决权。
-- **LOOSE + `fail_open`** 是最宽松的无人工值守配置，**同时也是风险最高的**：审阅器故障会在静默中关闭语义层，只留下静态分类器。只有在你接受相应风险时才应使用。
+- **不想使用动态审阅器**：推荐 **HARD + `fail_open`**——所有严格的静态 `DENY` 照常生效，审阅器缺席时 `ASK` 命令直接放行，完全不打扰 agent 的工作。
+- **不建议使用 `fail_ask`**：审阅器每次不可用或失败都会把存疑命令转成一次人工确认，大幅干扰 agent 活动。只有当你确实需要对每条存疑命令行使人工否决权时才选择它。
+- **HARD + `fail_close`** 是最严格的无人工值守配置：审阅器缺席时一切 `ASK` 命令都被拦截。
+- **LOOSE + `fail_open`** 是最宽松的无人工值守配置：审阅器故障会在静默中关闭语义层，只留下静态分类器。只有在你接受相应风险时才应使用。
 
-默认值是 `fail_ask`，而不是 `fail_open`。
+默认值是 `fail_open`。
 
 ### 人工批准（`fail_ask`）
 
@@ -157,9 +216,9 @@ API 密钥本身**仅**在发送给所配置端点的请求的 `Authorization` �
 ### 拒绝 / 失败升级（会话级）
 
 - **仅 HARD**：在一个会话中发生**任何**静态、动态或策略拒绝之后，该会话的下一条 bash 命令无论其静态结果如何，都会被强制进入动态审查，并附带上一次拒绝作为上下文。审阅器必须返回 `{decision, reason, bypassing}`；如果它判定新命令是对该拒绝的绕过（`bypassing: true`），则该命令会被拦截，并通过 `session.abort` 中止会话。LOOSE 从不记录拒绝，也不进行绕过检测。
-- **两种模式都适用**：一条 bash 命令**以非零状态退出**后，该会话中下一次本地脚本的执行会被强制进入动态审查，并附带失败上下文（命令、退出码、有界输出尾部）。普通的成功命令不会清除待处理的失败记录；只有消耗了该失败的强制审查运行才能清除。
+- **仅 HARD**：一条 bash 命令**以非零状态退出**后，该会话中的**下一条** bash 命令会被强制进入动态审查，并附带失败上下文（命令、退出码、有界输出尾部）：静态结果为 `ALLOW` 或 `ASK` 时一律转交审阅器；静态结果为 `DENY` 时保持静态拦截，且不消耗该失败记录。普通的成功命令不会清除待处理的失败记录；只有消耗了该失败的强制审查运行才会清除。LOOSE 从不记录失败，也不进行失败升级。
 - 所有状态（`lastRejected`、`lastFailed`、待处理批准、允许缓存）都是会话级的，**30 分钟**后过期，上限 **512** 个会话，并在会话被删除（`session.deleted`）时立即清除。
-- 成功的动态 `ALLOW` 结果可缓存 30 分钟（上限 512 条），仅当处于 LOOSE 模式、静态上下文可完全检查且审查并非由失败强制触发时生效；动态 `DENY` 从不缓存。
+- 成功的动态 `ALLOW` 结果可缓存 30 分钟（上限 512 条），仅当处于 LOOSE 模式且静态上下文可完全检查时生效；动态 `DENY` 从不缓存。
 
 ## 配置
 
@@ -170,10 +229,10 @@ API 密钥本身**仅**在发送给所配置端点的请求的 `Authorization` �
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "<absolute-path-to-plugin>",
+      "opencode-bash-classifier",
       {
         "strictness": "LOOSE",
-        "failPolicy": "fail_ask",
+        "failPolicy": "fail_open",
         "dynamicReview": {
           "baseURL": "https://api.example.com/v1",
           "model": "your-model-id",
@@ -190,14 +249,14 @@ API 密钥本身**仅**在发送给所配置端点的请求的 `Authorization` �
 }
 ```
 
-`<absolute-path-to-plugin>` 是本机上插件文件夹的绝对路径。`pythonPath` 可以是一个裸的解释器名（在启动时通过 PATH 解析），也可以是相对于包根目录的现有解释器路径；`auditorPath` 会相对于包根目录解析。修改这些选项后需重启 OpenCode。
+元组的第一个元素是 npm 包名（自动安装）；Clone 本地安装时则改为插件文件夹的绝对路径。`pythonPath` 可以是一个裸的解释器名（在启动时通过 PATH 解析），也可以是相对于包根目录的现有解释器路径；`auditorPath` 会相对于包根目录解析。修改这些选项后需重启 OpenCode。
 
 | 选项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `shell` | string | OpenCode 的 shell | 真实 shell 的覆盖项；同时作为分类器的方言提示。 |
 | `securityEnabled` | boolean | `true` | 是否完全启用分类器钩子。 |
 | `strictness` | `"LOOSE" \| "HARD"` | `"LOOSE"` | 选择静态规则集与动态 system prompt。 |
-| `failPolicy` | `"fail_ask" \| "fail_open" \| "fail_close"` | `"fail_ask"` | 审阅器不可用或失败时的行为。 |
+| `failPolicy` | `"fail_ask" \| "fail_open" \| "fail_close"` | `"fail_open"` | 审阅器不可用或失败时的行为。 |
 | `dynamicReview.baseURL` | string | — | OpenAI-compatible 基础 URL（会追加 `/chat/completions`）。HTTP 仅限 loopback 主机；远端必须使用 HTTPS。 |
 | `dynamicReview.model` | string | — | 模型 ID。 |
 | `dynamicReview.apiKey` | string | — | API 密钥（`apiKey` / `apiKeyEnv` 二者选一）。 |
@@ -213,16 +272,6 @@ API 密钥本身**仅**在发送给所配置端点的请求的 `Authorization` �
 | `supervisorPath` | string | 包默认值 | 指向监督器 `bash.exe` 的路径。 |
 
 插件还支持 `reviewCommand`，但仅用于编程式测试注入；插件本身从不挂接它。
-
-## 安装
-
-构建插件：
-
-```bash
-bun run build
-```
-
-如上所示，在 `opencode.json` 中使用 `<absolute-path-to-plugin>`（本机上插件文件夹的绝对路径）引用项目目录。修改插件配置或重新构建后，重启 OpenCode。
 
 ## Windows 进程监督器
 
@@ -243,7 +292,7 @@ bun run build:supervisor
 - 本插件是**纵深防御的护栏，而非操作系统沙箱**。它无法抵御坚决的恶意负载。
 - 构建、测试、安装和包管理命令可以、也确实会执行项目代码和第三方脚本。
 - 静态分类和 LLM 审查都会出错；请把任何 `ALLOW` 视为降低风险而非证明安全的决定。
-- 启用 `fail_open` 时，审阅器故障会静默地把策略放宽为仅静态——这是最宽松的无人工值守配置。
+- `fail_open`（当前默认）意味着审阅器故障会把策略静默放宽为仅静态——这是最宽松的无人工值守形态。
 - 动态审阅器会收到命令、路径和本地脚本内容；在启用第三方端点之前，请先阅读上文的外发数据一节。
 - OpenCode 的原生权限系统仍会在本插件的钩子之后运行，并继续作为最终闸门。
 

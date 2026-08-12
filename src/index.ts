@@ -209,12 +209,6 @@ function cacheDynamicAllow(cache: Map<string, number>, key: string, now: number)
   cache.set(key, now + DYNAMIC_ALLOW_CACHE_TTL_MS)
 }
 
-function isLocalScriptExecution(decision: StaticSecurityDecision) {
-  if (decision.rules.some((rule) => rule.startsWith("execution.local-script"))) return true
-  const ctx = decision.reviewContext
-  return Boolean(ctx && ((ctx.localScripts?.length ?? 0) > 0 || (ctx.uninspectedLocalScripts?.length ?? 0) > 0))
-}
-
 function isValidReviewResult(value: unknown, strict: boolean): value is CloudReviewResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const record = value as Record<string, unknown>
@@ -452,9 +446,7 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
 
       const rejectionAtStart = strictPolicy ? sessionState.lastRejected : undefined
       const failureAtStart =
-        sessionState.lastFailed &&
-        !sessionState.lastFailed.consumedBy &&
-        isLocalScriptExecution(staticDecision)
+        strictPolicy && sessionState.lastFailed && !sessionState.lastFailed.consumedBy
           ? sessionState.lastFailed
           : undefined
       const forcedByRejection = Boolean(rejectionAtStart)
@@ -626,6 +618,8 @@ export const BashSummaryPlugin: Plugin = async (pluginContext, rawOptions) => {
         }
         return
       }
+
+      if (!strictPolicy) return
 
       const command = commandFromArgs(input.args) ?? ""
       sessionState.lastFailed = {
