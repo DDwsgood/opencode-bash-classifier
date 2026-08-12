@@ -139,6 +139,8 @@ The bundled `auditor.py` is an independent, provider-neutral reviewer that talks
 
 Only endpoints you have verified to support both requirements will work; no provider capability is claimed here.
 
+> **Mind the terms of service**: the configured endpoint must allow calling the model through its **API/SDK**. Many subscription "coding plans" only permit using the model inside the provider's own designated coding tools; redirecting that allowance to a third-party caller like this plugin may violate the provider's terms and **can get your account banned**. Before enabling the dynamic reviewer, confirm that your provider explicitly allows this kind of usage.
+
 ### Round budget
 
 `maxRounds` is the number of rounds in which tool calls are allowed: **LOOSE defaults to 1 (configurable 1–3), HARD defaults to 2 (configurable 1–5)**. Once the round budget is exhausted, the auditor makes one final request with tools disabled to force a conclusion, and the whole review may use at most **8 tool calls** in total. For reasonable latency prefer a low-latency, lightweight model without a thinking mode.
