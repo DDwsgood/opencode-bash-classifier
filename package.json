@@ -1,0 +1,32 @@
+{
+  "name": "opencode-bash-classifier",
+  "version": "0.4.2-v2",
+  "description": "Execution-boundary command safety classifier for OpenCode's shell tool (v2 plugin API port): static per-segment review plus a tool-enhanced OpenAI-compatible model reviewer.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "native"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "opencode-v2",
+    "bash",
+    "shell",
+    "security",
+    "command-classifier",
+    "llm-reviewer",
+    "openai-compatible"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "next"
+  }
+}
