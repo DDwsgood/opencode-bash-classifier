@@ -61,7 +61,7 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 
 const DYNAMIC_ALLOW_CACHE_TTL_MS = 30 * 60 * 1000
 const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
-const PROMPT_VERSION = "v1"
+const PROMPT_VERSION = "v2"
 const SESSION_STATE_TTL_MS = 30 * 60 * 1000
 const MAX_SESSION_STATES = 512
 const MAX_OUTPUT_TAIL_CHARS = 2000
@@ -220,6 +220,35 @@ function sanitizeOutputTail(output: string) {
   return trimmed.slice(-MAX_OUTPUT_TAIL_CHARS).replace(/\s+/g, " ").trim()
 }
 
+/**
+ * §4.10 (F36/F37): normalizes the variable identifiers of known read-only
+ * parametrized commands so repeated inspections share a dynamic-ALLOW cache
+ * entry. Only patterns whose parameters do NOT change security semantics are
+ * rewritten; the dynamic reviewer always sees the RAW script.
+ *
+ * `kill <pid>` is deliberately NOT normalized: a cached ALLOW for an ordinary
+ * PID could otherwise be reused for a critical system PID without review.
+ * `sed -e '…'` (semantics-changing) is not normalized either.
+ */
+function normalizeCacheKeyScript(script: string): string {
+  const text = script
+    // bare reads only: `docker logs/inspect/top/stats <container>` (flags keep the raw form)
+    .replace(/^docker\s+(logs|inspect|top|stats)\s+([A-Za-z0-9_.][A-Za-z0-9_.-]*)$/gi, "docker $1 <id>")
+    // `kubectl logs/top <pod>`
+    .replace(/^kubectl\s+(logs|top)\s+([A-Za-z0-9_.-]+)$/gi, "kubectl $1 <id>")
+    // `kubectl get|describe <type> <name>` (secrets excluded: different security class)
+    .replace(
+      /^kubectl\s+(get|describe)\s+(?!(?:secret|secrets)\b)([A-Za-z0-9_.-]+)\s+([A-Za-z0-9_.-]+)$/gi,
+      "kubectl $1 $2 <id>",
+    )
+    // psql … -c "SELECT…" / -c 'SELECT…' (read-only SQL payload)
+    .replace(
+      /(^|[\s;])(-c|--command)\s+(["'])(select|show|describe|explain|vacuum|analyze|begin|prepare|deallocate|values|with)[\s\S]*?\3/gi,
+      "$1$2 $3<query>$3",
+    )
+  return text
+}
+
 function dynamicAllowCacheKey(
   sessionID: string,
   script: string,
@@ -241,7 +270,7 @@ function dynamicAllowCacheKey(
 
   const payload = {
     sessionID,
-    script,
+    script: normalizeCacheKeyScript(script),
     cwd,
     shell,
     rules: decision.rules,
@@ -250,6 +279,7 @@ function dynamicAllowCacheKey(
       size: fingerprint.size,
       mtimeMs: fingerprint.mtimeMs,
       sha256: fingerprint.sha256,
+      linkPath: fingerprint.linkPath ?? null,
     })),
     targetDirectories: context?.targetDirectories ?? [],
     referencedPaths: context?.referencedPaths ?? [],
