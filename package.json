@@ -12,7 +12,13 @@
   },
   "files": [
     "src",
-    "native"
+    "native/windows-bash-supervisor/README.md",
+    "native/windows-bash-supervisor/Cargo.toml",
+    "native/windows-bash-supervisor/Cargo.lock",
+    "native/windows-bash-supervisor/src/main.rs",
+    "native/windows-bash-supervisor/test/integration.mjs",
+    "native/windows-bash-supervisor/target/release/bash.exe",
+    "native/windows-bash-supervisor/target/release/opencode-bash-supervisor.exe"
   ],
   "keywords": [
     "opencode",
