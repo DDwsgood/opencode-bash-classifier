@@ -2082,7 +2082,11 @@ function isExplicitDisposableCleanup(script: string, cwd: string, worktree: stri
     ) {
       return true
     }
-    return false
+    // PowerShell flag-interleaved forms (`rm -Force -Recurse .\node_modules`,
+    // `rm -r -f node_modules`) carry extra flags after the leading flag group;
+    // let the generic invocation branch below parse them instead of rejecting
+    // them here (they must still pass the strict recursive/flags checks there).
+    if (!targets.some((t) => t.startsWith("-"))) return false
   }
 
   const invocation = value.match(/^(?:remove-item|rm)\s+(.+)$/i)
@@ -2585,7 +2589,17 @@ function isKnownSafeSegment(segment: string) {
   if (/^touch\b/i.test(value)) return true
   if (/^(?:cp|mv)\b(?![\s\S]*\s-[A-Za-z])\b/i.test(value)) return true
   if (/^install\s+-m\s+\d+\b/i.test(value)) return true
-  if (/^rmdir\b/i.test(value)) return true
+  // `rmdir` is the empty-directory remover on POSIX but a Remove-Item alias on
+  // PowerShell/cmd: `-r/-recurse/-rf/-fr` and `/s` turn it into a forced
+  // recursive delete. Only the plain empty-directory form is provably safe;
+  // recursive forms must fall through to the destructive-delete rules.
+  if (
+    /^rmdir\b/i.test(value) &&
+    !/-(?:recurse|rf|fr|\br\b)(?:\s|$)/i.test(value) &&
+    !/(?:^|\s)[/\\][\s]*[sS](?=\s|$)/.test(value)
+  ) {
+    return true
+  }
 
   // Build cleanup (disposable artifacts)
   if (/^make\s+(?:clean|distclean|mrproper)\b|^make\s*$/i.test(value)) return true
@@ -3522,8 +3536,17 @@ async function classifySegment(
   ]
   const combined = surfaces.map(maskHeredocBody).join("\n\n")
   const reviewSignals = new Map<string, string>()
+  // A quote-stripped variant of THIS same segment (`Remove-Item -LiteralPath
+  // ".\dist" -Recurse -Force` unquotes to the identical delete invocation) is
+  // not an evasion surface, so it must not suppress disposable-cleanup
+  // recognition. Any other extra surface (decoded payload, wrapped payload,
+  // ANSI, variable substitution) still denies the exemption.
+  const quoteSurfaceOfThisSegment = quoteStrippedDeleteSurface(segment)
+  const onlyInnocentSurfaces =
+    surfaces.length === 1 ||
+    (surfaces.length === 2 && quoteSurfaceOfThisSegment !== undefined && surfaces[1] === quoteSurfaceOfThisSegment)
   const explicitDisposableCleanup =
-    isExplicitDisposableCleanup(segment, base, input.worktree) && surfaces.length === 1
+    isExplicitDisposableCleanup(segment, base, input.worktree) && onlyInnocentSurfaces
 
   const knownSafe = isKnownSafeSegment(stripOutputRedirects(segment) ?? segment)
   const hasExpansion = hasDynamicShellExpansion(segment, input.shell)

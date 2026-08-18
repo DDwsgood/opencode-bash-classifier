@@ -765,7 +765,7 @@ def _post_chat(payload: dict[str, Any], api_key: str) -> dict[str, Any]:
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "User-Agent": "opencode-bash-classifier-auditor/0.4.0",
+                "User-Agent": "opencode-bash-classifier-auditor/0.5.1",
             },
             method="POST",
         )
