@@ -2,6 +2,20 @@ import { createHash } from "node:crypto"
 import type { Dirent } from "node:fs"
 import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
+import {
+  analyzeSegmentPaths,
+  checkPathSensitivity,
+  extractReadPaths,
+  hasSensitiveEnvPrefix,
+  hasUnquotedExpansion,
+  resolveLexical,
+  isWithinLexical,
+  classifyPathTarget,
+  sensitivePathFinding,
+  segmentCommandLeaf,
+  stripOutputRedirects,
+  type PathContext,
+} from "./paths"
 
 export type SecurityVerdict = "ALLOW" | "DENY" | "ASK"
 
@@ -10,6 +24,16 @@ export type ScriptFingerprint = {
   size: number
   mtimeMs: number
   sha256: string
+  /**
+   * Present when the executed path was a symlink at classification time.
+   * The post-check then verifies the link itself (dev/ino/mtime) is unchanged
+   * and still resolves to the same canonical file, closing the symlink-swap
+   * TOCTOU window.
+   */
+  linkPath?: string
+  linkDev?: number
+  linkIno?: number
+  linkMtimeMs?: number
 }
 
 export type LocalScriptReviewContext = {
@@ -87,7 +111,7 @@ const CRITICAL_DATA_EXTENSION = /\.(?:pem|key|p12|pfx|ppk|jks|keystore|kdbx|gpg|
 const GENERAL_DATA_EXTENSION =
   /\.(?:csv|jsonl?|ya?ml|toml|ini|db|sqlite(?:3)?|sql|parquet|avro|xlsx?|docx?|pptx?|pdf)(?=$|[\s"';&|)])/i
 const DELETE_PRIMITIVE =
-  /\b(?:rm|ri|del|erase|rmdir|rd|remove-item|clear-content|unlink|unlinkSync|rmSync|rmtree|os\.remove|os\.unlink|shutil\.rmtree)\b|(?:^|\s)-delete(?:\s|$)|\.unlink\s*\(/i
+  /\b(?:rm|ri|del|erase|rmdir|rd|remove-item|clear-content|unlink|unlinkSync|rmSync|rmtree|os\.remove|os\.unlink|shutil\.rmtree|shred|srm|wipe)\b|(?:^|\s)-delete(?:\s|$)|\.unlink\s*\(/i
 const SCRIPT_DESTRUCTIVE_PRIMITIVE = new RegExp(
   [
     // Shell deletion / process-kill commands, matched on raw text including inside quoted string literals
@@ -241,6 +265,8 @@ function hasHostShutdownCommand(text: string): boolean {
     const command = firstToken.replace(/\.(?:exe|cmd|bat|ps1)$/i, "").toLowerCase()
     if (["shutdown", "reboot", "poweroff", "halt"].includes(command)) return true
     if (/^stop-computer\b/i.test(stripped)) return true
+    if (/\binit\s+[06]\b/i.test(stripped)) return true
+    if (/\bsystemctl\s+(?:reboot|poweroff|halt|emergency|rescue)\b/i.test(stripped)) return true
   }
   return false
 }
@@ -248,6 +274,406 @@ function hasHostShutdownCommand(text: string): boolean {
 function hasDeletePrimitive(text: string): boolean {
   const stripped = text.replace(/'[^']*'/g, "").replace(/"(?:[^"]|"")*"/g, "")
   return DELETE_PRIMITIVE.test(stripped)
+}
+
+// --- M2 (P1) helper predicates ---------------------------------------------
+
+function isDangerousFindRoot(root: string): boolean {
+  const r = root.replaceAll("\\", "/")
+  if (r === "~" || r.startsWith("~/")) return true
+  if (r === ".." || r.startsWith("../")) return true
+  const lower = r.toLowerCase()
+  if (lower === "/") return true
+  return ["/etc", "/var", "/boot", "/usr", "/bin", "/sbin", "/home", "/root", "/opt", "/sys", "/proc", "/mnt"].some(
+    (p) => lower === p || lower.startsWith(p + "/"),
+  )
+}
+
+function findDangerousDeleteRoot(text: string): boolean {
+  const match = text.match(/\bfind\s+(\S+)[\s\S]*?(?:\s|^)-(?:delete|exec|execdir|ok|okdir)(?:\s|$)/im)
+  if (!match) return false
+  return isDangerousFindRoot(match[1] ?? "")
+}
+
+function hasForkBomb(text: string): boolean {
+  const stripped = text.replace(/["']/g, "")
+  if (/(?:^|[;&\s]):\s*\(\s*\)\s*\{[^{}]*\|\s*:\s*&?[^{}]*\}[\s;&]*:/.test(stripped)) return true
+  if (/([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{[^{}]*\|\s*\1\s*&?[^{}]*\}[\s;&]*\1/.test(stripped)) return true
+  if (/\bwhile\s+(?:true|1|:|\[[^\]]*\])\b[^;]*;\s*do\s+[^;]*\$0\s*&/.test(stripped)) return true
+  if (/(?:^|[;&\s])([A-Za-z0-9_.:*-]+)\s*\|\s*\1\s*&/.test(stripped)) return true
+  return false
+}
+
+function hasDestructiveOneLiner(text: string): boolean {
+  const interpreter =
+    /\b(?:python(?:3(?:\.\d+)?)?|py|node|perl|ruby|php)\b[^\n]{0,60}\s-(?:c|e|r|pe|escript)\b/i.test(text)
+  if (!interpreter) return false
+  const destructiveApi =
+    /(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)\s*\(|fs(?:\.promises)?\.(?:rm|unlink|rmdir)(?:Sync)?\s*\(|rmSync\s*\(|File\.delete\s*\(|File\.unlink\s*\(|unlinkSync\s*\(|\bunlink\s+)/i.test(
+      text,
+    )
+  if (!destructiveApi) return false
+  return /['"`](\/|\/\*|\\|[\\/]etc[\\/]|[\\/]var[\\/]|[\\/]boot[\\/]|[\\/]usr[\\/]|[\\/]bin[\\/]|[\\/]sbin[\\/]|[\\/]home[\\/]|[\\/]root[\\/])/.test(
+    text,
+  )
+}
+
+function commandTokenUnquote(token: string): string {
+  return token.replace(/^(["'])([\s\S]*)\1$/, "$2")
+}
+
+/**
+ * Re-surfaces a segment whose first token, after removing quotes, is a
+ * destructive command, so `'rm' -rf /` / `rm '-rf' /` are caught without
+ * flagging `echo 'rm -rf /'`.
+ */
+function quoteStrippedDeleteSurface(segment: string): string | undefined {
+  const tokens = simpleInvocationTokens(segment.trim())
+  if (tokens.length === 0) return undefined
+  const first = commandTokenUnquote(tokens[0] ?? "")
+  const leaf = first
+    .split("/")
+    .at(-1)
+    ?.replace(/\.(?:exe|cmd|bat|ps1)$/i, "")
+    .toLowerCase()
+  if (!leaf || !/^(?:rm|rmdir|rd|del|erase|remove-item|ri|shred|srm|wipe|unlink)\b/.test(leaf)) {
+    return undefined
+  }
+  const stripped = tokens.map(commandTokenUnquote).join(" ")
+  return stripped.trim() === segment.trim() ? undefined : stripped
+}
+
+function decodeAnsiCContent(script: string): string[] {
+  const decoded: string[] = []
+  const matches = script.matchAll(/\$'([^']*)'/g)
+  for (const match of matches) {
+    const raw = match[1] ?? ""
+    let out = ""
+    for (let i = 0; i < raw.length; i += 1) {
+      const ch = raw[i]
+      if (ch !== "\\" || i + 1 >= raw.length) {
+        out += ch
+        continue
+      }
+      const next = raw[i + 1]
+      if (next === "x" && i + 3 < raw.length) {
+        const hex = raw.slice(i + 2, i + 4)
+        if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+          out += String.fromCharCode(parseInt(hex, 16))
+          i += 3
+          continue
+        }
+      }
+      const oct = raw.slice(i + 1).match(/^[0-7]{1,3}/)?.[0]
+      if (oct) {
+        out += String.fromCharCode(parseInt(oct, 8))
+        i += oct.length
+        continue
+      }
+      const escapes: Record<string, string> = { "\\": "\\", "'": "'", '"': '"', n: "\n", t: "\t", r: "\r", a: "\u0007", b: "\b", f: "\f", v: "\v" }
+      out += escapes[next] ?? next
+      i += 1
+    }
+    if (out.trim()) decoded.push(out)
+  }
+  return decoded
+}
+
+/** Expands `/{a,b}`/`src/{a,b}` style brace candidates used by a delete target. */
+function braceExpansionCandidates(target: string): string[] {
+  const open = target.indexOf("{")
+  if (open === -1) {
+    const close = target.indexOf("}")
+    if (close === -1) return [target]
+  }
+  const close = target.indexOf("}", open + 1)
+  if (open === -1 || close === -1) return [target]
+  const prefix = target.slice(0, open)
+  const suffix = target.slice(close + 1)
+  return (target.slice(open + 1, close) ?? "")
+    .split(",")
+    .filter((item) => item.length > 0)
+    .map((item) => `${prefix}${item}${suffix}`)
+}
+
+/** `rm -rf /{etc,var,home}` expands to a sensitive/root target. */
+function hasDangerousBraceDelete(text: string): boolean {
+  const invocations =
+    text.match(/\b(?:rm|remove-item|ri|del|erase|rmdir|rd)\b[^\r\n;&|]*/gi) ?? []
+  for (const invocation of invocations) {
+    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    const shape = forcedRecursiveShape(tokens)
+    if (!shape.forced || shape.targets.length === 0) continue
+    for (const target of shape.targets) {
+      if (!target.includes("{")) continue
+      for (const candidate of braceExpansionCandidates(target)) {
+        if (isDangerousFindRoot(candidate)) return true
+      }
+    }
+  }
+  return false
+}
+
+/** `D=rm; $D -rf /tmp/x` → surface with the variable substituted back. */
+function substituteDeleteVars(script: string): string | undefined {
+  const assignments = script.match(/([A-Za-z_][A-Za-z0-9_]*)=(?:rm|shred|srm|wipe|rmdir|remove-item|del|erase|unlink)\b/gi)
+  if (!assignments || assignments.length === 0) return undefined
+  let result = script
+  for (const assignment of assignments) {
+    const name = assignment.slice(0, assignment.indexOf("="))
+    const value = assignment.slice(assignment.indexOf("=") + 1).toLowerCase()
+    if (new RegExp(`(?:^|[\\s;&|])[\\$]\\{?${name}\\}?(?=[\\s;&|])`, "i").test(script)) {
+      result = result.replace(new RegExp(`[\\$]\\{?${name}\\}?`, "g"), value)
+    }
+  }
+  return result === script ? undefined : result
+}
+
+function hasTarRemoveFiles(text: string): boolean {
+  return /\btar\b[^\n;]*--remove-files\b/i.test(text)
+}
+
+/** DENY-both rules that need filesystem context: compression of sensitive files, tar --remove-files. */
+function compressionDestructionFinding(segment: string, ctx: PathContext): SegmentDecision | undefined {
+  const command = segmentCommandLeaf(segment)
+  if (["gzip", "bzip2", "xz", "zip", "7z", "rar"].includes(command)) {
+    for (const raw of extractReadPaths(segment)) {
+      if (checkPathSensitivity(raw, ctx).sensitive) {
+        return {
+          verdict: "DENY",
+          rules: ["filesystem.compression-sensitive"],
+          reason: "Compressing or archiving credential or system files is forbidden",
+        }
+      }
+    }
+    return undefined
+  }
+  if (hasTarRemoveFiles(segment)) {
+    for (const raw of extractReadPaths(segment)) {
+      if (checkPathSensitivity(raw, ctx).sensitive) {
+        return {
+          verdict: "DENY",
+          rules: ["data.critical-delete"],
+          reason: "tar --remove-files on credential or system files is forbidden",
+        }
+      }
+    }
+    return {
+      verdict: "ASK",
+      rules: ["filesystem.tar-remove-files"],
+      reason: "tar --remove-files permanently removes the archived files and requires review",
+    }
+  }
+  return undefined
+}
+
+function hasExfilOrDangerousPerms(segment: string, text: string, ctx: PathContext): string | undefined {
+  // curl/wget upload of a sensitive file
+  const uploadPaths: string[] = []
+  const uploadPatterns = [
+    /(?:-d|--data|--data-binary|--data-raw)(?:=|\s+)@?(['"]?)([^\s'"=<]+)\1/gi,
+    /(?:-F|--form)[^\n]*?=@(['"]?)([^\s'"]+)\1/gi,
+    /--post-file(?:=|\s+)(['"]?)([^\s'"]+)\1/gi,
+  ]
+  for (const pattern of uploadPatterns) {
+    for (const match of text.matchAll(pattern)) uploadPaths.push(match[2] ?? "")
+  }
+  if (uploadPaths.some((p) => checkPathSensitivity(p, ctx).sensitive)) return "exfiltration.sensitive-data"
+
+  // scp: local sources before the `user@host:` token
+  if (/\bscp\b/i.test(text)) {
+    const tokens = simpleInvocationTokens(segment)
+    let hostIndex = -1
+    for (let i = 0; i < tokens.length; i += 1) {
+      if (/^[^@\s]+@[^:\s]+:/.test(tokens[i] ?? "")) {
+        hostIndex = i
+        break
+      }
+    }
+    if (hostIndex > 0) {
+      for (let i = 1; i < hostIndex; i += 1) {
+        const token = tokens[i] ?? ""
+        if (token.startsWith("-")) continue
+        if (checkPathSensitivity(token, ctx).sensitive) return "exfiltration.sensitive-data"
+      }
+    }
+  }
+
+  // nc/ncat stream from a sensitive file
+  if (/\b(?:nc|ncat|netcat)\b/i.test(text)) {
+    const stream = text.match(/\b(?:nc|ncat|netcat)\b[^\n]*<\s*['"]?([^\s'";|&]+)/i)
+    if (stream && checkPathSensitivity(stream[1] ?? "", ctx).sensitive) return "exfiltration.sensitive-data"
+  }
+
+  // chmod 000/777 on a sensitive/credential path
+  if (/\bchmod\b[^\n]*\s(?:0{3}|777)\b/i.test(text)) {
+    const tokens = simpleInvocationTokens(segment)
+    const args = tokens
+      .slice(1)
+      .filter(
+        (token) =>
+          !/^-(?:R|v|c|f|h)$/.test(token) &&
+          !/^\d{3,4}$/.test(token) &&
+          !/^(?:u|g|o|a)?[+-]=?[rwxXst]{1,3}$/.test(token),
+      )
+    if (args.some((p) => checkPathSensitivity(p, ctx).sensitive)) return "permissions.sensitive-mode"
+  }
+
+  return undefined
+}
+
+// ===== M3 (P2) §4.9 dedicated-safe whitelist helpers =======================
+
+function tarOrUnzipBaseWorktree(segment: string, cwd: string, worktree: string): boolean {
+  // returns true when every -C / -d target (or the default cwd) is inside the worktree
+  const dirs = [...segment.matchAll(/\s-C\s+("([^"]*)"|'([^']*)'|(\S+))/gi)].map((m) => m[2] ?? m[3] ?? m[4] ?? ".")
+  const unzipDirs = [...segment.matchAll(/\s-d\s+("([^"]*)"|'([^']*)'|(\S+))/gi)].map((m) => m[2] ?? m[3] ?? m[4] ?? ".")
+  const bases = dirs.length > 0 ? dirs : unzipDirs.length > 0 ? unzipDirs : ["."]
+  if (bases.length === 0) return false
+  return bases.every((dir) => {
+    const resolved = resolveLexical(dir, cwd, expandHome("~"))
+    return Boolean(resolved.absolute && isWithinLexical(worktree, resolved.absolute))
+  })
+}
+
+function classifyTarExtractOrUnzip(
+  segment: string,
+  ctx: PathContext,
+  strictness: "LOOSE" | "HARD",
+  isUnzip: boolean,
+): SegmentDecision | undefined {
+  const isExtract = isUnzip ? /^unzip\b/i.test(segment) : /^tar\b/i.test(segment)
+  if (!isExtract) return undefined
+  if (!isUnzip && /(?:--absolute-names|--remove-files)\b/i.test(segment)) return undefined
+  if (!tarOrUnzipBaseWorktree(segment, ctx.cwd, ctx.worktree)) {
+    if (strictness === "HARD") {
+      return {
+        verdict: "DENY",
+        rules: ["filesystem.tar-extract-system"],
+        reason: "Extracting an archive into a non-worktree location is forbidden",
+      }
+    }
+    return {
+      verdict: "ASK",
+      rules: ["filesystem.tar-extract-system"],
+      reason: "Extracting an archive outside the working tree requires review",
+    }
+  }
+  const finding = analyzeSegmentPaths(segment, ctx)
+  if (finding.kind === "pass") {
+    return {
+      verdict: "ALLOW",
+      rules: ["operation.archive-extract"],
+      reason: "Archive extracts into a recognized working-tree location",
+    }
+  }
+  return { verdict: finding.kind === "deny" ? "DENY" : "ASK", rules: [finding.rule], reason: finding.reason }
+}
+
+function isSafeDownloadTarget(segment: string, ctx: PathContext): boolean {
+  // curl/wget writing a worktree file from an https URL, no upload / eval flags
+  if (!/^curl\b|^wget\b/i.test(segment)) return false
+  if (/\b(?:-d|--data(?:\-raw|\-binary)?|-F|--form|--post-file|--upload-file|-T)\b/i.test(segment)) return false
+  if (/-A\b|--user-agent\b/.test(segment)) return false
+  if (!/\shttp(s)?:\/\/|^curl\b[^\n]*https?:\/\//i.test(segment)) return false
+  if (!/(?:^|\s)-(?:o|O)\b|\s--(?:output|remote-name)\b/.test(segment)) return false
+  if (!tarOrUnzipBaseWorktree(segment, ctx.cwd, ctx.worktree)) return false
+  return analyzeSegmentPaths(segment, ctx).kind === "pass"
+}
+
+function safeChmodSegment(segment: string, cwd: string, worktree: string): boolean {
+  const tokens = simpleInvocationTokens(segment.trim())
+  if (commandLeaf(tokens[0] ?? "") !== "chmod") return false
+  if (/\b-R\b|--recursive\b/i.test(segment)) return false
+  const modeIndex = tokens.findIndex((t) => /^[0-7]{3,4}$/.test(t) || /^[ugoa]*[+-=][rwxXst]+$/.test(t))
+  if (modeIndex === -1) return false
+  const mode = tokens[modeIndex] ?? ""
+  const safeOctal = /^(?:600|640|644|700|750|755|660)$/.test(mode)
+  const safeSymbolic = /^\+x$/.test(mode) || /^-[xw]+$/.test(mode)
+  if (!safeOctal && !safeSymbolic) return false
+  const targets = tokens.slice(modeIndex + 1).filter((t) => !/^-[A-Za-z]/.test(t) && !t.startsWith("--"))
+  if (targets.length === 0) return false
+  return targets.every((t) => {
+    if (t.startsWith("~") || t.startsWith("$HOME")) return true
+    const resolved = resolveLexical(t, cwd, expandHome("~"))
+    return Boolean(resolved.absolute && isWithinLexical(worktree, resolved.absolute))
+  })
+}
+
+function commandSubstitutionBodies(text: string): string[] {
+  const bodies: string[] = []
+  let i = 0
+  while (i < text.length) {
+    const start = text.indexOf("$(", i)
+    if (start === -1) break
+    let depth = 1
+    let j = start + 2
+    while (j < text.length && depth > 0) {
+      if (text[j] === "(") depth += 1
+      else if (text[j] === ")") depth -= 1
+      if (depth > 0) j += 1
+    }
+    bodies.push(text.slice(start + 2, j))
+    i = j + 1
+  }
+  return bodies
+}
+
+function maskCommandSubstitutions(text: string): string {
+  let out = ""
+  let i = 0
+  while (i < text.length) {
+    const start = text.indexOf("$(", i)
+    if (start === -1) {
+      out += text.slice(i)
+      break
+    }
+    out += text.slice(i, start) + "x"
+    let depth = 1
+    let j = start + 2
+    while (j < text.length && depth > 0) {
+      if (text[j] === "(") depth += 1
+      else if (text[j] === ")") depth -= 1
+      if (depth > 0) j += 1
+    }
+    i = j + 1
+  }
+  return out
+}
+
+function isSafeSubstitutionSurface(text: string, shell: string, ctx: PathContext, depth = 0): boolean {
+  if (depth > 6) return false
+  const subs = commandSubstitutionBodies(text)
+  const masked = maskCommandSubstitutions(text)
+  const stripped = stripOutputRedirects(masked) ?? masked
+  if (!isKnownSafeSegment(stripped)) return false
+  if (hasUnquotedExpansion(maskHeredocBody(stripped), shell)) return false
+  if (hasSensitiveEnvPrefix(stripped)) return false
+  if (analyzeSegmentPaths(stripped, ctx).kind !== "pass") return false
+  for (const body of subs) {
+    if (!isSafeSubstitutionSurface(body, shell, ctx, depth + 1)) return false
+  }
+  return true
+}
+
+function isDisposableDirectoryDelete(script: string, cwd: string, worktree: string): boolean {
+  const value = stripLeadingDirectoryChanges(script).replace(/\s+/g, " ").trim()
+  const rm = value.match(/^rm\s+-[a-z]*[rf][a-z]*\s+(.+)$/i)
+  if (!rm) return false
+  const targets = rm[1].trim().split(/\s+/)
+  const pattern =
+    /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)[\\/]?$/i
+  if (targets.length === 0 || !targets.every((t) => pattern.test(t))) return false
+  return targets.every((t) => isWorktreeDisposableTarget(t, cwd, worktree))
+}
+
+function classifySafeChmod(segment: string, ctx: PathContext, strictness: "LOOSE" | "HARD"): SegmentDecision | undefined {
+  const tokens = simpleInvocationTokens(segment.trim())
+  if (commandLeaf(tokens[0] ?? "") !== "chmod") return undefined
+  if (safeChmodSegment(segment, ctx.cwd, ctx.worktree)) {
+    return { verdict: "ALLOW", rules: ["permissions.lockdown"], reason: "Setting safe, standard file permissions" }
+  }
+  return undefined
 }
 
 const SECURITY_SIGNAL_RULES: Rule[] = [
@@ -279,9 +705,11 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   },
   {
     id: "filesystem.disk-destruction",
-    reason: "Attempts to format, overwrite, or destroy a disk or filesystem",
+    reason: "Attempts to format, overwrite, destroy a disk/filesystem, or create a device node",
     test: (text) =>
       /\b(?:mkfs(?:\.\w+)?|wipefs|fdisk|parted)\b/i.test(text) ||
+      /\bmknod\b/i.test(text) ||
+      /\bshred\b[^\n]*\/dev\/(?:sd|nvme|vd|hd|xvd|mmcblk|dasd)[a-z0-9-]*\b/i.test(text) ||
       /\bformat(?:\.com)?\s+[a-z]:/i.test(text) ||
       /\bdiskpart\b[\s\S]{0,500}\bclean(?:\s+all)?\b/i.test(text) ||
       /\bdd\b[^\n]*(?:if=\/dev\/(?:zero|urandom|random))[^\n]*of=\/dev\/(?:sd|nvme|vd|xvd)/i.test(text),
@@ -314,8 +742,9 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     id: "system.critical-process-kill",
     reason: "Attempts broad or critical forced process termination",
     test: (text) =>
-      /\bkill\s+(?:-[a-z]*9|-KILL)\s+(?:-1|0|1)\b/i.test(text) ||
+      /\bkill\s+-(?:[a-z]*9|[A-Z]*KILL|TERM|INT|HUP)\s+(?:-1|0|1)\b/i.test(text) ||
       /\b(?:pkill|killall)\b[^\n]*(?:-9|-KILL)\b/i.test(text) ||
+      /\b(?:pkill|killall)\b[^\n]*\s(?:systemd|init)\b/i.test(text) ||
       /\btaskkill\b[^\n]*\/f[^\n]*(?:\/im\s+\*|\/pid\s+(?:0|4)\b)/i.test(text),
   },
   {
@@ -333,8 +762,64 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       /\bterraform\s+destroy\b/i.test(text) ||
       /\bkubectl\s+delete\s+(?:namespace|ns|persistentvolume|pv|persistentvolumeclaim|pvc)\b/i.test(text) ||
       /\bdocker\s+(?:volume\s+rm|system\s+prune[^\n]*-a)\b/i.test(text) ||
+      /\bdocker\s+(?:volume\s+prune\s+-a|image\s+prune\s+-a|rmi\s+-f\b)\b/i.test(text) ||
       /\baws\s+s3\s+rm\b[^\n]*--recursive\b/i.test(text) ||
       /\bgcloud\s+[^\n]*\bdelete\b[^\n]*(?:project|cluster|instance)\b/i.test(text),
+  },
+  {
+    id: "filesystem.find-delete-root",
+    reason: "Recursive find deletion under a system, home, or filesystem root",
+    test: findDangerousDeleteRoot,
+  },
+  {
+    id: "execution.xargs-destructive",
+    reason: "Pipes files into a destructive command via xargs",
+    test: (text) =>
+      /\|\s*xargs\b[^\n]*\b(?:rm|shred|srm|wipe|unlink|rmdir|rd|del|erase|remove-item)\b/i.test(text),
+  },
+  {
+    id: "execution.fork-bomb",
+    reason: "Contains a shell fork-bomb (process storm) primitive",
+    test: hasForkBomb,
+  },
+  {
+    id: "filesystem.kernel-trigger",
+    reason: "Attempts to write the kernel sysrq trigger or crash mechanisms",
+    test: (text) => /(?:>\s*|of=)[^\n]*\/proc\/sysrq-trigger\b/i.test(text),
+  },
+  {
+    id: "filesystem.kernel-core-pattern",
+    reason: "Attempts to set a piped core_pattern (kernel code execution)",
+    test: (text) => /\/proc\/sys\/kernel\/core_pattern\b[^\n]*\||\|[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text),
+  },
+  {
+    id: "permissions.root-recursive",
+    reason: "Recursively locks or opens permissions on a system/root directory",
+    test: (text) =>
+      /\bchmod\b\s+-R\s+(?:0|000|777)\b[^\n]*\s+(?:\/|~\/?|\/etc\b|\/usr\b|\/bin\b|\/sbin\b|\/boot\b|\/var\b|\/home\b|\/root\b|\/opt\b)/i.test(
+        text,
+      ),
+  },
+  {
+    id: "execution.kernel-module-load",
+    reason: "Loads a kernel module into the running kernel",
+    test: (text) =>
+      /\binsmod\b/i.test(text) || /(?:^|[\s;])modprobe\b[^\n]*(?:\s+-\w+)*\s+(?!-)([A-Za-z0-9_+.:-]+)/i.test(text),
+  },
+  {
+    id: "filesystem.compression-root",
+    reason: "Recursively compressing the filesystem root is destructive",
+    test: (text) => /\bgzip\b\s+(?:-\w+\s+)*-r\b\s+\//i.test(text),
+  },
+  {
+    id: "execution.script-one-liner-destructive",
+    reason: "A script one-liner performs destructive filesystem operations",
+    test: hasDestructiveOneLiner,
+  },
+  {
+    id: "filesystem.brace-root-delete",
+    reason: "Forced-recursive deletion of brace-expanded system roots",
+    test: hasDangerousBraceDelete,
   },
   {
     id: "git.irrecoverable-change",
@@ -375,7 +860,12 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     test: (text) =>
       /\/dev\/tcp\/|\/dev\/udp\//i.test(text) ||
       /\b(?:nc|ncat|netcat)\b[^\n]*(?:\s-e\s|\s--exec\s)/i.test(text) ||
-      /\bsocket\.connect\s*\([^)]*(?:4444|1337|9001)/i.test(text),
+      /\bsocat\b[^\n]*(?:\s(?:EXEC|SYSTEM|EXEC):)/i.test(text) ||
+      /\bmkfifo\b[^\n]*(?:\|\s*(?:cat|sh|bash)[^\n]*\|\s*(?:nc|ncat|netcat))/i.test(text) ||
+      /\bsocket\.connect\s*\([^)]*\)[^\n]{0,200}(?:subprocess|dup2|os\.system|popen)/i.test(text) ||
+      /(?:subprocess\.(?:Popen|call|run)\s*\([^\n]*\/bin\/(?:sh|bash)|cp\.spawn\s*\(\s*["']sh["']|TCPSocket\.new\s*\([^)]*\)[^\n]{0,120}(?:IO\.popen|Kernel\.(?:system|exec))|fsockopen\s*\([^)]*\)[^\n]{0,120}(?:exec|system|popen)|TCPClient|Socket::And|exec\s*\(\s*["']\/bin\/sh[^)]*\))/i.test(
+        text,
+      ),
   },
   {
     id: "credentials.sensitive-access",
@@ -401,7 +891,116 @@ const DEFINITE_DESTRUCTIVE_RULES = new Set([
   "system.critical-process-kill",
   "database.destructive-statement",
   "infrastructure.destructive-operation",
+  "network.reverse-shell",
+  "filesystem.find-delete-root",
+  "execution.xargs-destructive",
+  "execution.fork-bomb",
+  "filesystem.kernel-trigger",
+  "filesystem.kernel-core-pattern",
+  "permissions.root-recursive",
+  "execution.kernel-module-load",
+  "filesystem.compression-root",
+  "execution.script-one-liner-destructive",
+  "filesystem.brace-root-delete",
 ])
+
+/**
+ * Rules that DENY in HARD mode and downgrade to an ASK review signal in LOOSE.
+ * Mirrors the plan: destructive operations the HARD (injected-agent) model must
+ * never auto-run, but good-faith LOOSE work may still be reviewed by the
+ * dynamic layer (e.g. official installers).
+ */
+const HARD_DENY_LOOSE_ASK_RULES: { id: string; reason: string; test: (text: string) => boolean }[] = [
+  {
+    id: "execution.remote-pipe",
+    reason: "Downloads remote content and immediately executes it",
+    test: (text) =>
+      /\b(?:curl|wget|invoke-webrequest|iwr|irm)\b[\s\S]{0,1000}(?:\||&&|;|\r?\n)[\s\S]{0,300}\b(?:bash|sh|zsh|python(?:3)?(?:\.exe)?|py(?:\.exe)?|node|powershell|pwsh|invoke-expression|iex)\b/i.test(
+        text,
+      ),
+  },
+  {
+    id: "kernel.sysctl-write",
+    reason: "Modifying kernel parameters requires review",
+    test: (text) => /\bsysctl\b[^\n]*\s-w\b/i.test(text),
+  },
+  {
+    id: "infrastructure.privileged-container",
+    reason: "Running a privileged container or mounting the Docker socket requires review",
+    test: (text) =>
+      /\bdocker\s+run\b[^\n]*(?:--privileged\b|--pid=host\b|-v\s+\/var\/run\/docker\.sock\b|--host=unix:\/\/\/var\/run\/docker\.sock\b)/i.test(
+        text,
+      ),
+  },
+  {
+    id: "infrastructure.cluster-delete",
+    reason: "Destructive cluster/container/cloud operation requires review",
+    test: (text) =>
+      /\bkubectl\s+delete\b[^\n]*(?:\sall\b|\s--all\b)|\bkubectl\s+drain\b[^\n]*--force\b|\bhelm\s+uninstall\b/i.test(text),
+  },
+  {
+    id: "infrastructure.cloud-delete",
+    reason: "Destructive cloud resource deletion requires review",
+    test: (text) =>
+      /\baws\s+s3\s+rb\b[^\n]*--force\b|\baws\s+(?:iam\s+delete-|ec2\s+terminate-instances|rds\s+delete-db-instance)\b|\bgcloud\b[^\n]*\bdelete\b[^\n]*(?:project|cluster|instance)\b|\baz\b[^\n]*\bdelete\b[^\n]*--yes\b/i.test(
+        text,
+      ),
+  },
+  {
+    id: "permissions.setuid",
+    reason: "Granting setuid/setcap capabilities requires review",
+    test: (text) =>
+      /\bchmod\b[^\n]*(?:\s[2467][0-7]{3}\b|\+s\b|u\+s\b|g\+s\b)|\bsetcap\b[^\n]*(?:cap_setuid|cap_all|cap_dac_read_search|cap_sys_admin)\+ep\b|\binstall\s+-m\s+[24][0-7]{3}\b/i.test(
+        text,
+      ),
+  },
+  {
+    id: "network.firewall-mutate",
+    reason: "Mutating firewall or network configuration requires review",
+    test: (text) =>
+      /\biptables\b[^\n]*\s-[FP]\b|\bnft\s+flush\s+ruleset\b|\bufw\s+(?:disable|reset)\b|\bip\s+(?:addr|route)\s+flush\b|\bifconfig\b[^\n]*\s+down\b/i.test(
+        text,
+      ),
+  },
+  {
+    id: "namespace.escape",
+    reason: "Entering or creating isolated namespaces requires review",
+    test: (text) =>
+      /\bnsenter\s+-t\s+1\b|\bunshare\b[^\n]*(?:--mount\b|--pid\b|--user\b|--mount-proc\b)/i.test(text),
+  },
+  {
+    id: "filesystem.tar-extract-system",
+    reason: "Extracting an archive into a system directory requires review",
+    test: (text) =>
+      /\btar\b[^\n]*(?:-C\s+\/(?:etc|var|boot|usr|bin|sbin|home|root)\b|--absolute-names\b)/i.test(text),
+  },
+  {
+    id: "forensic.history-clear",
+    reason: "Clearing command history or disabling history recording requires review",
+    test: (text) =>
+      /\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bexport\s+HISTFILE\s*=\s*(?:\/dev\/null|:)?\b|HISTSIZE\s*=\s*0\b/i.test(text),
+  },
+  {
+    id: "forensic.journal-vacuum",
+    reason: "Vacuuming or deleting journal/log data requires review",
+    test: (text) => /\bjournalctl\b[^\n]*--vacuum/i.test(text),
+  },
+  {
+    id: "exfiltration.dns",
+    reason: "DNS-exfiltrating command output requires review",
+    test: (text) => /\b(?:nslookup|dig|host)\b[^\n]*\$\(/i.test(text),
+  },
+  {
+    id: "execution.encoded-shell",
+    reason: "Executing an encoded PowerShell payload requires review",
+    test: (text) => /\b(?:pwsh|powershell)(?:\.exe)?\b[^\n]*-(?:EncodedCommand|EncodedArguments|enc)\b/i.test(text),
+  },
+  {
+    id: "forensic.var-log-delete",
+    reason: "Deleting log output requires review",
+    test: (text) => /\b(?:rm|shred|find)\b[^\n]*\/var\/log\b/i.test(text),
+  },
+]
 
 function normalized(value: string) {
   return value.normalize("NFKC").replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
@@ -507,7 +1106,7 @@ type ParsedDeleteInvocation = {
 function parseDeleteInvocation(segment: string): ParsedDeleteInvocation | undefined {
   const tokens = simpleInvocationTokens(segment.trim())
   const command = commandLeaf(tokens[0] ?? "")
-  if (!["rm", "remove-item", "del", "erase", "unlink", "rmdir", "rd", "ri"].includes(command ?? "")) {
+  if (!["rm", "remove-item", "del", "erase", "unlink", "rmdir", "rd", "ri", "shred", "srm", "wipe"].includes(command ?? "")) {
     return undefined
   }
 
@@ -521,6 +1120,10 @@ function parseDeleteInvocation(segment: string): ParsedDeleteInvocation | undefi
     "-outvariable",
     "-outbuffer",
     "-pipelinevariable",
+    "-n",
+    "--iterations",
+    "-s",
+    "--size",
   ])
   const optionsWithoutValues = new Set([
     "-f",
@@ -538,6 +1141,12 @@ function parseDeleteInvocation(segment: string): ParsedDeleteInvocation | undefi
     "-force",
     "-recurse",
     "-confirm:$false",
+    "-u",
+    "--remove",
+    "-z",
+    "--zero",
+    "-x",
+    "--exact",
   ])
   let optionsEnded = false
 
@@ -1216,6 +1825,18 @@ async function classifyBackupPolicy(
   const copy = parseCopyInvocation(segment)
   const copyTarget = copy && literalPathToken(copy.target)
   if (copyTarget && backupPathIdentity(copyTarget)) {
+    const copySource = copy && literalPathToken(copy.source)
+    const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+    const targetResolved = resolveLexical(copyTarget, input.cwd, expandHome("~"))
+    const absolute = targetResolved.absolute
+    const inWorktree = absolute !== undefined && isWithinLexical(input.worktree, absolute)
+    const lower = absolute?.toLowerCase() ?? ""
+    const inTemp = lower === "/tmp" || lower.startsWith("/tmp/") || lower === "/var/tmp" || lower.startsWith("/var/tmp/")
+    if (!inWorktree && !inTemp) return undefined
+    if (!checkPathSensitivity(copyTarget, ctx).parseable || checkPathSensitivity(copyTarget, ctx).sensitive) {
+      return undefined
+    }
+    if (copySource && checkPathSensitivity(copySource, ctx).sensitive) return undefined
     return {
       verdict: "ALLOW",
       rules: ["filesystem.backup-copy"],
@@ -1384,28 +2005,88 @@ function resolveCdBase(dir: string | undefined, base: string | undefined) {
   return path.isAbsolute(expanded) ? path.normalize(expanded) : base ? path.resolve(base, expanded) : undefined
 }
 
-function isExplicitDisposableCleanup(script: string) {
+function isWorktreeDisposableTarget(target: string, cwd: string, worktree: string): boolean {
+  const literal = literalPathToken(target)
+  if (!literal) return false
+  const resolved = resolveLexical(literal, cwd, expandHome("~"))
+  return resolved.absolute !== undefined && isWithinLexical(worktree, resolved.absolute)
+}
+
+function isTempDisposableTarget(target: string, cwd: string): boolean {
+  const literal = literalPathToken(target)
+  if (!literal) return false
+  const resolved = resolveLexical(literal, cwd, expandHome("~"))
+  if (!resolved.absolute) return false
+  const absolute = resolved.absolute.toLowerCase()
+  if (absolute === "/tmp" || absolute.startsWith("/tmp/")) return true
+  if (absolute === "/var/tmp" || absolute.startsWith("/var/tmp/")) return true
+  const downloads = expandHome("~/Downloads").toLowerCase()
+  return absolute.startsWith(`${downloads}/`)
+}
+
+function isTempFindRoot(root: string, cwd: string): boolean {
+  const literal = literalPathToken(root)
+  if (!literal) return false
+  const resolved = resolveLexical(literal, cwd, expandHome("~"))
+  if (!resolved.absolute) return false
+  const absolute = resolved.absolute.toLowerCase()
+  return absolute === "/tmp" || absolute.startsWith("/tmp/")
+}
+
+function isExplicitDisposableCleanup(script: string, cwd: string, worktree: string): boolean {
   const value = stripLeadingDirectoryChanges(script).replace(/\s+/g, " ").trim()
   const disposableDirectory =
-    String.raw`(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__)(?:[\\/]|\b)`
+    String.raw`(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?|(?=\s+(?:&&|$)))`
   const reinstall = String.raw`(?:\s*&&\s*(?:npm|pnpm|yarn|bun)\s+(?:install|i))?`
-  const patterns = [
-    new RegExp(String.raw`^rm\s+-[a-z]*[rf][a-z]*\s+${disposableDirectory}[\\/]?${reinstall}$`, "i"),
-    /^rm\s+-f\s+(?:\/tmp\/[^\s;&|]+|~[\\/]Downloads[\\/][^\s;&|]*\.tmp)$/i,
-    /^find\s+\/tmp\b[^;&|]*\s-mtime\s+\+\d+\b[^;&|]*\s-delete$/i,
+  const disposablePattern =
+    /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)[\\/]?$/i
+
+  const rmSingle = value.match(
     new RegExp(
-      String.raw`^remove-item\s+(?:"|')?${disposableDirectory}(?:"|')?\s+(?:(?:-recurse|-force)\s*){1,2}$`,
+      String.raw`^rm\s+-[a-z]*[rf][a-z]*\s+((?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?))(?:\s*&&\s+(?:npm|pnpm|yarn|bun)\s+(?:install|i))?$`,
       "i",
     ),
-  ]
-  if (patterns.some((pattern) => pattern.test(value))) return true
+  )
+  if (rmSingle) {
+    return disposablePattern.test(rmSingle[1]) && isWorktreeDisposableTarget(rmSingle[1], cwd, worktree)
+  }
+
+  const rmForce = value.match(/^rm\s+-f\s+([^;&|]+)$/i)
+  if (rmForce) {
+    const target = rmForce[1].trim()
+    if (/^\/tmp\//.test(target) || /^~[\\/]Downloads[\\/][^\s]*\.tmp$/.test(target)) {
+      return isTempDisposableTarget(target, cwd)
+    }
+    return false
+  }
+
+  const findTmp = value.match(/^find\s+(\S+)\b[^;&|]*\s-mtime\s+\+\d+\b[^;&|]*\s-delete$/i)
+  if (findTmp) return isTempFindRoot(findTmp[1], cwd)
+
+  const removeItem = value.match(
+    new RegExp(
+      String.raw`^remove-item\s+(?:"|')?((?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?))(?:"|')?\s+(?:(?:-recurse|-force)\s*){1,2}$`,
+      "i",
+    ),
+  )
+  if (removeItem) {
+    return disposablePattern.test(removeItem[1]) && isWorktreeDisposableTarget(removeItem[1], cwd, worktree)
+  }
 
   const rmMultiMatch = value.match(/^rm\s+-[a-z]*[rf][a-z]*\s+(.+)$/i)
   if (rmMultiMatch) {
     const targets = rmMultiMatch[1].trim().split(/\s+/)
-    const disposablePattern =
-      /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__)[\\/]?$/i
-    if (targets.length > 0 && targets.every((t) => disposablePattern.test(t))) return true
+    if (
+      targets.length > 0 &&
+      targets.every((t) => disposablePattern.test(t) && isWorktreeDisposableTarget(t, cwd, worktree))
+    ) {
+      return true
+    }
+    // PowerShell flag-interleaved forms (`rm -Force -Recurse .\node_modules`,
+    // `rm -r -f node_modules`) carry extra flags after the leading flag group;
+    // let the generic invocation branch below parse them instead of rejecting
+    // them here (they must still pass the strict recursive/flags checks there).
+    if (!targets.some((t) => t.startsWith("-"))) return false
   }
 
   const invocation = value.match(/^(?:remove-item|rm)\s+(.+)$/i)
@@ -1435,9 +2116,10 @@ function isExplicitDisposableCleanup(script: string) {
     .replace(/^(["'])([\s\S]*)\1$/, "$2")
     .replaceAll("\\", "/")
     .replace(/\/+$/, "")
-  return /(?:^|\/)(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__)(?:\/.*)?$/i.test(
-    normalizedTarget,
-  )
+  if (!/(?:^|\/)(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:\/.*)?$/i.test(normalizedTarget)) {
+    return false
+  }
+  return isWorktreeDisposableTarget(target, cwd, worktree)
 }
 
 function shellEscapeCharacter(shell: string) {
@@ -1451,23 +2133,128 @@ function shellSupportsSingleQuotes(shell: string) {
   return path.basename(shell).replace(/\.(?:exe|cmd|bat)$/i, "").toLowerCase() !== "cmd"
 }
 
-function stripTimeoutPrefix(segment: string): string | undefined {
-  const tokens = simpleInvocationTokens(segment.trim())
-  if (commandLeaf(tokens[0] ?? "") !== "timeout") return segment
-  let index = 1
-  while (index < tokens.length) {
-    const lower = tokens[index].toLowerCase()
-    if (lower === "--" || !lower.startsWith("-")) break
+function strictTimeoutRemainder(tokens: string[]): string | undefined {
+  let i = 1
+  for (;;) {
+    if (i >= tokens.length) return undefined
+    const lower = tokens[i].toLowerCase()
+    if (lower === "--") {
+      i += 1
+      break
+    }
+    if (!lower.startsWith("-")) break
     if (lower === "-k" || lower === "--kill-after" || lower === "-s" || lower === "--signal") {
-      index += 2
+      i += 2
       continue
     }
-    index += 1
+    if (lower === "--verbose" || lower === "--foreground" || lower === "--preserve-status") {
+      i += 1
+      continue
+    }
+    return undefined
   }
-  if (index >= tokens.length) return undefined
-  index += 1
-  if (index >= tokens.length) return undefined
-  return tokens.slice(index).join(" ")
+  if (i >= tokens.length || !/^\d+(\.\d+)?[smhd]?$/.test(tokens[i] ?? "")) return undefined
+  i += 1
+  if (i >= tokens.length) return undefined
+  return tokens.slice(i).join(" ")
+}
+
+/**
+ * Strict wrapper stripping (mirrors Claude Code `stripWrappersFromArgv`).
+ * Unknown or malformed flags ⇒ do NOT strip ⇒ the segment falls through to ASK.
+ * `env -S`, `watch`, and flag-injection forms are deliberately not stripped.
+ */
+function stripWrapperPrefix(segment: string): string | undefined {
+  const original = segment
+  const tokens = simpleInvocationTokens(segment.trim())
+  if (tokens.length === 0) return segment
+  const leaf = commandLeaf(tokens[0] ?? "")
+  if (leaf === "timeout") return strictTimeoutRemainder(tokens)
+  if (leaf === "time" || leaf === "nohup" || leaf === "setsid") {
+    if (tokens.length >= 2 && !(tokens[1] ?? "").startsWith("-")) return tokens.slice(1).join(" ")
+    return original
+  }
+  if (leaf === "nice") {
+    let i = 1
+    if (i < tokens.length && tokens[i] === "--") return tokens.slice(i + 1).join(" ")
+    if (i < tokens.length && /^-\d+$/.test(tokens[i] ?? "")) return tokens.slice(i + 1).join(" ")
+    if (i < tokens.length && (tokens[i] === "-n" || tokens[i] === "--adjustment")) {
+      if (i + 1 < tokens.length && /^-?\d+$/.test(tokens[i + 1] ?? "")) return tokens.slice(i + 2).join(" ")
+      return original
+    }
+    if (i < tokens.length && !(tokens[i] ?? "").startsWith("-")) return tokens.slice(1).join(" ")
+    return original
+  }
+  if (leaf === "ionice") {
+    let i = 1
+    while (i < tokens.length && (tokens[i] ?? "").startsWith("-") && tokens[i] !== "--") {
+      const t = tokens[i] ?? ""
+      if (t === "-t") {
+        i += 1
+      } else if (t === "-c" || t === "-n" || t === "-p") {
+        if (i + 1 >= tokens.length) return original
+        i += 2
+      } else {
+        return original
+      }
+    }
+    if (i >= tokens.length || (tokens[i] ?? "").startsWith("-") || (tokens[i] ?? "") === "--") return original
+    return tokens.slice(i).join(" ")
+  }
+  if (leaf === "stdbuf") {
+    let i = 1
+    while (i < tokens.length && ((tokens[i] ?? "").startsWith("-") || tokens[i] === "--")) {
+      const t = tokens[i] ?? ""
+      if (t === "--") {
+        i += 1
+        break
+      }
+      if (/^-[ioe]$/.test(t)) {
+        if (i + 1 >= tokens.length) return original
+        i += 2
+        continue
+      }
+      if (/^-[ioe]\S+$/.test(t) || t === "-L" || t === "--line-buffered") {
+        i += 1
+        continue
+      }
+      return original
+    }
+    if (i >= tokens.length) return original
+    return tokens.slice(i).join(" ")
+  }
+  if (leaf === "env") {
+    let i = 1
+    let sawCommand = false
+    while (i < tokens.length) {
+      const t = tokens[i] ?? ""
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) {
+        i += 1
+        continue
+      }
+      if (t === "-i" || t === "--ignore-environment" || t === "-0" || t === "--null") {
+        i += 1
+        continue
+      }
+      if (t === "-u" || t === "--unset" || t === "--unset-environment") {
+        if (i + 1 >= tokens.length) return original
+        i += 2
+        continue
+      }
+      if (t === "-v" || t === "--debug") {
+        i += 1
+        continue
+      }
+      if (t === "-S" || t === "--split-string" || t === "-C" || t === "-P" || t === "--argv0") {
+        return original
+      }
+      sawCommand = true
+      break
+    }
+    if (!sawCommand || i >= tokens.length) return original
+    return tokens.slice(i).join(" ")
+  }
+  return segment
 }
 
 function stripHarmlessPrefixes(segment: string): string {
@@ -1478,9 +2265,9 @@ function stripHarmlessPrefixes(segment: string): string {
       result = subshell[1].trim()
       continue
     }
-    const timeoutStripped = stripTimeoutPrefix(result)
-    if (timeoutStripped && timeoutStripped !== result) {
-      result = timeoutStripped
+    const wrapperStripped = stripWrapperPrefix(result)
+    if (wrapperStripped && wrapperStripped !== result) {
+      result = wrapperStripped
       continue
     }
     break
@@ -1660,6 +2447,9 @@ function isKnownSafeSegment(segment: string) {
   const harmlessValue = value
     .replace(/>\s*\/dev\/(?:null|stdout|stderr)\b/gi, "")
     .replace(/>\s*\$null\b/gi, "")
+    .replace(/<[ \t]*\/?dev\/(?:null|stdin)\b/gi, "")
+    .replace(/(?:^|[\s;&|])<<</g, "")
+    .replace(/(?:^|[\s;&|])\d*<[ \t]+[^\s<;&|()]+/g, "")
   if (/[<>](?![=])/.test(harmlessValue)) return false
   if (/^(?:true|false|:)\b/i.test(value)) return true
 
@@ -1699,13 +2489,15 @@ function isKnownSafeSegment(segment: string) {
   if (/^git\s+(?:status|diff|log|show|rev-parse|ls-files|grep|remote\s+-v|add|commit)\b/i.test(value)) return true
   if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+|pull|switch|merge)\b/i.test(value)) return true
   if (
-    /^git\s+push\b(?![\s\S]*(?:\s--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b))/i.test(value)
+    /^git\s+push\b(?![\s\S]*(?:\s--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s--(?:delete|mirror)\b|\s:(?:refs\/)?[\w./-]+))/i.test(
+      value,
+    )
   ) {
     return true
   }
   if (/^(?:mkdir|New-Item\s+[^\n]*-ItemType\s+Directory)\b/i.test(value)) return true
   if (/^(?:tar\s+-[a-z]*c[a-z]*f|zip\s+-r)\b/i.test(value)) return !/--remove-files\b/i.test(value)
-  if (/^(?:cp|copy|Copy-Item)\b/i.test(value)) return false
+  if (/^(?:cp|copy|Copy-Item)\b/i.test(value) && /[\s\S]*\s-[A-Za-z]/.test(value)) return false
   if (
     /^(?:(?:python(?:3)?(?:\.exe)?|py(?:\.exe)?)\s+-m\s+pytest|pytest|bun\s+test|cargo\s+(?:test|check|fmt)|go\s+test|black|isort|prettier|eslint|tsc)\b/i.test(
       value,
@@ -1722,13 +2514,103 @@ function isKnownSafeSegment(segment: string) {
   }
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|lint|format|check|build))\b/i.test(value)) return true
   if (/^(?:npm|pnpm|yarn|bun)\s+(?:install|i|add|ci)\b/i.test(value)) return true
-  if (/^(?:pip(?:3)?|pipx|uv)\s+(?:install|add)\b/i.test(value)) return true
+  if (/^(?:pip(?:3)?|pipx|uv)\s+(?:install|add|list|show|freeze|check)\b/i.test(value)) return true
   if (/^cargo\s+(?:add|fetch|update)\b/i.test(value)) return true
   if (/^go\s+(?:get|mod\s+download)\b/i.test(value)) return true
   if (/^dotnet\s+(?:restore|build)\b/i.test(value)) return true
   if (/^(?:cargo\s+build|go\s+build|cmake\s+--build|ninja|vite\s+build|next\s+build|nuxt\s+build|svelte-kit\s+build|webpack|rollup|esbuild|tsc)\b/i.test(value)) return true
   if (/^make\b/i.test(value) && !/\bclean\b/i.test(value)) return true
   if (/^(?:mvnw?|maven|gradlew?)\s+(?:build|package|compile|install|verify|assemble|bundle|jar|compileJava|deploy)\b/i.test(value) && !/\bclean\b/i.test(value)) return true
+
+  // ===== M3 (P2) §4.9: false-positive reduction with P/E front-end =====
+  // Text processing (read-only); `sed -i` write targets are validated by the path layer.
+  if (/^(?:cut|column|tr|tac|nl|pr|fmt|fold|paste|join|comm|expand|shuf|strings|xxd|od|hexdump)\b/i.test(value)) return true
+  // awk is only acceptable as a pure text filter; `system(` / `| getline` / `getline <`
+  // primitives can execute commands or read files, so they force a review.
+  if (/^awk\b(?![\s\S]*(?:system\s*\(|\|\s*getline|getline\s*<\s*))/i.test(value)) return true
+  if (/^(?:md5sum|sha1sum|sha224sum|sha256sum|sha384sum|sha512sum|basename|dirname|realpath|readlink|seq|expr)\b/i.test(value)) return true
+  if (/^yq\b(?![\s\S]*-i\b)/i.test(value)) return true
+  if (/^sed\b/i.test(value)) return true
+
+  // Read-only system inspection
+  if (/^(?:id|uptime|cal|type|lsattr|getfattr|lscpu|lsmod|lsusb|lspci|locale|getent|atq)\b/i.test(value)) return true
+  if (/^(?:jobs|wait|bg|fg)\b/i.test(value)) return true
+  if (/^history\s*(?:\d+)?\s*$/i.test(value)) return true
+  if (/^alias\s*$/i.test(value)) return true
+  if (/^lsof\b(?![\s\S]*\s-k\b)/i.test(value)) return true
+  if (/^timedatectl\s+status\b/i.test(value)) return true
+  if (/^ip\s+(?:addr|address|link|route)\b[\s\S]*\b(?:show|list)\b/i.test(value)) return true
+  if (/^ip\s+(?:addr|address|link|route)\s*$/i.test(value)) return true
+  if (/^ifconfig\b(?![\s\S]*(?:\s+up\b|\s+down\b|\s+add\b|\s+del\b|\s+remove\b))/i.test(value)) return true
+  if (/^mount\s*(?:-l|l|--list)?\s*$/i.test(value)) return true
+  if (/^crontab\s+-l\b/i.test(value)) return true
+  if (/^fdisk\s+-[lL]\b/i.test(value)) return true
+  if (/^parted\s+(?:--list|-l)\b/i.test(value)) return true
+  if (/^parted\b(?![\s\S]*(?:mklabel|mkpart|mkpartfs|resizepart|mkswap|\srm\s|disk_set|disk_toggle))(?:-s\s+)?(?:\/dev\/\S+|-\S+)\s+print\b/i.test(value)) return true
+  if (/^lsblk\b/i.test(value)) return true
+  if (/^systemctl\s+(?:status|is-active|is-enabled|is-failed|list-units|list-unit-files|show|daemon-reload|cat|help)\b/i.test(value)) return true
+  if (/^journalctl\b(?![\s\S]*--vacuum)/i.test(value)) return true
+  if (/^ufw\s+status\b/i.test(value)) return true
+  if (/^docker\s+(?:logs|inspect|top|events)\b/i.test(value)) return true
+  if (/^docker\s+stats\s+--no-stream\b/i.test(value)) return true
+  if (/^kubectl\s+(?:logs|top)\b/i.test(value)) return true
+  // `kubectl get|describe` is read-only EXCEPT secret/secrets (credential material)
+  if (/^kubectl\s+(?:get|describe)\b(?![\s\S]*\b(?:secret|secrets)\b)/i.test(value)) return true
+  if (/^(?:test\b|\[)/.test(value)) return true
+
+  // Package managers (declarative read / verify / safe uninstall / known run scripts)
+  if (/^npm\s+run\s+(?:dev|start|serve)\b/i.test(value)) return true
+  if (/^npm\s+run-script\s+(?:test|lint|format|check|build|dev|start|serve)\b/i.test(value)) return true
+  if (/^npm\s+(?:start|list|outdated|view|audit)\b/i.test(value)) return true
+  if (/^npm\s+cache\s+verify\b/i.test(value)) return true
+  if (/^npm\s+(?:uninstall|remove)\b/i.test(value)) return true
+  if (/^(?:pip(?:3)?|pipx|uv)\s+uninstall\b/i.test(value)) return true
+  if (/^(?:yarn|pnpm)\s+remove\b/i.test(value)) return true
+  if (/^cargo\s+(?:clippy|tree|metadata|uninstall)\b/i.test(value)) return true
+  if (/^go\s+(?:fmt|vet|list)\b/i.test(value)) return true
+  if (/^npx\s+--no-install\s+(?:eslint|tsc|prettier|vitest|jest|mocha|bun\s+test)\b/i.test(value)) return true
+
+  // git read-only / safe-mutating surface
+  if (/^git\s+blame\b/i.test(value)) return true
+  if (/^git\s+describe\b/i.test(value)) return true
+  if (/^git\s+config\s+(?:--list|-l)\b/i.test(value)) return true
+  if (/^git\s+stash\s+(?:push|pop|apply)\b/i.test(value)) return true
+  if (/^git\s+tag\s*$/i.test(value)) return true
+  if (/^git\s+branch\s+-d\b/.test(value)) return true
+  if (/^git\s+branch\s*$/i.test(value)) return true
+  if (/^node\s+(?:--version|-v\b|--help)\b/i.test(value)) return true
+  if (/^(?:yarn|pnpm|bun)\s+(?:dev|start|serve|build|lint|format|check)\b/i.test(value)) return true
+  if (/^poetry\s+(?:add|install|lock|update|export)\b/i.test(value)) return true
+  if (/^uv\s+sync\b/i.test(value)) return true
+  if (/^terraform\s+(?:plan|validate|fmt|version)\b/i.test(value)) return true
+  if (/^(?:nslookup|dig)\b/i.test(value)) return true
+
+  // File operations (write targets validated by the path layer)
+  if (/^touch\b/i.test(value)) return true
+  if (/^(?:cp|mv)\b(?![\s\S]*\s-[A-Za-z])\b/i.test(value)) return true
+  if (/^install\s+-m\s+\d+\b/i.test(value)) return true
+  // `rmdir` is the empty-directory remover on POSIX but a Remove-Item alias on
+  // PowerShell/cmd: `-r/-recurse/-rf/-fr` and `/s` turn it into a forced
+  // recursive delete. Only the plain empty-directory form is provably safe;
+  // recursive forms must fall through to the destructive-delete rules.
+  if (
+    /^rmdir\b/i.test(value) &&
+    !/-(?:recurse|rf|fr|\br\b)(?:\s|$)/i.test(value) &&
+    !/(?:^|\s)[/\\][\s]*[sS](?=\s|$)/.test(value)
+  ) {
+    return true
+  }
+
+  // Build cleanup (disposable artifacts)
+  if (/^make\s+(?:clean|distclean|mrproper)\b|^make\s*$/i.test(value)) return true
+  if (/^(?:mvnw?|maven)\s+clean\b/i.test(value)) return true
+  if (/^(?:\.?\/)?gradlew\s+clean\b/i.test(value)) return true
+
+  // Scripts / interpreters (mode-agnostic safe surfaces)
+  if (/^(?:python(?:3)?(?:\.exe)?|py(?:\.exe)?)\s+-m\s+venv\b/i.test(value)) return true
+  if (/^openssl\s+(?:genrsa|req|verify|x509|pkey|ecparam|genpkey|dhparam)\b/i.test(value)) return true
+  if (/^gunzip\b|\bgzip\s+-d\b/i.test(value)) return true
+
   return false
 }
 
@@ -2187,6 +3069,25 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
   if (!info.isFile() || info.size > MAX_LOCAL_SCRIPT_BYTES) return undefined
   const content = await readFile(canonical)
   if (content.includes(0)) return undefined
+
+  let linkPath: string | undefined
+  let linkDev: number | undefined
+  let linkIno: number | undefined
+  let linkMtimeMs: number | undefined
+  if (canonical !== absolute) {
+    try {
+      const linkInfo = await lstat(absolute)
+      if (linkInfo.isSymbolicLink()) {
+        linkPath = absolute
+        linkDev = linkInfo.dev
+        linkIno = linkInfo.ino
+        linkMtimeMs = linkInfo.mtimeMs
+      }
+    } catch {
+      return undefined
+    }
+  }
+
   return {
     content: content.toString("utf8"),
     reviewPath: path.relative(worktree, canonical).replaceAll("\\", "/") || path.basename(canonical),
@@ -2195,12 +3096,38 @@ async function fingerprintLocalScript(candidate: string, cwd: string, worktree: 
       size: info.size,
       mtimeMs: info.mtimeMs,
       sha256: createHash("sha256").update(content).digest("hex"),
+      ...(linkPath !== undefined
+        ? { linkPath, linkDev: linkDev as number, linkIno: linkIno as number, linkMtimeMs: linkMtimeMs as number }
+        : {}),
     } satisfies ScriptFingerprint,
   }
 }
 
 export async function verifyScriptFingerprints(fingerprints: ScriptFingerprint[]) {
   for (const fingerprint of fingerprints) {
+    if (fingerprint.linkPath !== undefined) {
+      let linkInfo
+      try {
+        linkInfo = await lstat(fingerprint.linkPath)
+      } catch {
+        return false
+      }
+      if (!linkInfo.isSymbolicLink()) return false
+      if (
+        linkInfo.dev !== fingerprint.linkDev ||
+        linkInfo.ino !== fingerprint.linkIno ||
+        linkInfo.mtimeMs !== fingerprint.linkMtimeMs
+      ) {
+        return false
+      }
+      let canonical
+      try {
+        canonical = await realpath(fingerprint.linkPath)
+      } catch {
+        return false
+      }
+      if (canonical !== fingerprint.path) return false
+    }
     let info
     let content
     try {
@@ -2248,6 +3175,21 @@ async function classifyHardDeletionPolicy(
   const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
   const combined = surfaces.join("\n\n")
 
+  // HARD-mode exemption for clearing recognized disposable directories inside
+  // the working tree (node_modules, dist, .venv, .next, out, ... §4.9).
+  if (
+    input.cwd !== undefined &&
+    input.worktree !== undefined &&
+    isDisposableDirectoryDelete(segment, input.cwd, input.worktree)
+  ) {
+    return {
+      verdict: "ALLOW",
+      rules: ["cleanup.disposable"],
+      reason: "Forced deletion is limited to a recognized disposable directory inside the working tree",
+      fingerprints: [],
+    }
+  }
+
   if (hasForcedRecursiveDelete(combined)) {
     return {
       verdict: "DENY",
@@ -2280,6 +3222,19 @@ async function classifyHardDeletionPolicy(
 
       for (const target of deletion.targets) {
         const cleaned = stripMatchingQuotes(target)
+        const pathFinding = classifyPathTarget(cleaned, "delete", {
+          cwd: base ?? input.cwd,
+          worktree: input.worktree,
+          strictness: "HARD",
+        })
+        if (pathFinding.kind === "deny") {
+          return {
+            verdict: "DENY",
+            rules: [pathFinding.rule],
+            reason: pathFinding.reason,
+            fingerprints: [],
+          }
+        }
         if (hasNamedTempPathSegment(cleaned)) {
           return {
             verdict: "DENY",
@@ -2305,6 +3260,54 @@ async function classifyHardDeletionPolicy(
             fingerprints: [],
           }
         }
+      }
+    }
+  }
+  return undefined
+}
+
+async function recycleTargetsFinding(
+  targets: string[],
+  base: string,
+  input: ClassifyShellCommandInput,
+  strictness: Strictness,
+): Promise<SegmentDecision | undefined> {
+  const ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+  const home = expandHome("~")
+  const tempRoots = await trustedUserLocalTempRoots(input)
+  for (const target of targets) {
+    const literal = literalPathToken(target)
+    if (!literal) {
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.recycle-bin-unverified"],
+        reason: "The recycle-bin target is not a verifiable literal path",
+      }
+    }
+    const decision = classifyPathTarget(literal, "delete", ctx)
+    if (decision.kind !== "pass") {
+      return {
+        verdict: decision.kind === "deny" ? "DENY" : "ASK",
+        rules: [decision.rule],
+        reason: decision.reason,
+      }
+    }
+    const resolved = resolveLexical(literal, base, home)
+    const absolute = resolved.absolute
+    if (!absolute) {
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.recycle-bin-unverified"],
+        reason: "The recycle-bin target cannot be resolved to a concrete path",
+      }
+    }
+    const inWorktree = isWithinLexical(input.worktree, absolute)
+    const inTemp = tempRoots.some((root) => isWithinLexical(root, absolute))
+    if (!inWorktree && !inTemp && !hasNamedTempPathSegment(literal)) {
+      return {
+        verdict: "ASK",
+        rules: ["filesystem.recycle-bin-outside"],
+        reason: "Moving a target outside the working tree to the recycle bin requires review",
       }
     }
   }
@@ -2345,6 +3348,8 @@ async function classifySegment(
 
   const recycle = explicitRecycleBinOperation(segment, input.shell)
   if (recycle) {
+    const recycleFinding = await recycleTargetsFinding(recycle.targets, base, segInput, strictness)
+    if (recycleFinding) return recycleFinding
     if (strictness === "HARD") {
       const tempRoots = await trustedUserLocalTempRoots(segInput)
       for (const target of recycle.targets) {
@@ -2432,18 +3437,149 @@ async function classifySegment(
     }
   }
 
-  const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
+  const wslPayload = segment.match(/^wsl(?:\.exe)?\s+--\s+([\s\S]+)$/i)
+  if (wslPayload && (wslPayload[1] ?? "").trim()) {
+    const payload = wslPayload[1] ?? ""
+    const strippedPayload = stripOutputRedirects(payload) ?? payload
+    if (
+      isKnownSafeSegment(strippedPayload) &&
+      !hasDynamicShellExpansion(payload, input.shell) &&
+      !hasUnquotedExpansion(maskHeredocBody(payload), input.shell) &&
+      !hasSensitiveEnvPrefix(payload) &&
+      analyzeSegmentPaths(payload, { cwd: base, worktree: input.worktree, strictness }).kind === "pass"
+    ) {
+      return {
+        verdict: "ALLOW",
+        rules: ["operation.wsl-safe"],
+        reason: "The WSL payload is a recognized safe operation",
+      }
+    }
+  }
+
+  // ---- M3 (P2) §4.9: dedicated safe surfaces -----------------------------
+  const m3ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
+
+  const tarOrUnzip = classifyTarExtractOrUnzip(segment, m3ctx, strictness, /^unzip\b/i.test(segment))
+  if (tarOrUnzip) return tarOrUnzip
+
+  if ((/^curl\b/i.test(segment) || /^wget\b/i.test(segment)) && strictness === "LOOSE" && !input.cwdUnknown) {
+    if (isSafeDownloadTarget(segment, m3ctx)) {
+      return {
+        verdict: "ALLOW",
+        rules: ["operation.download"],
+        reason: "Downloads a file into the working tree from an HTTPS URL",
+      }
+    }
+  } else if (/^python(?:3)?(?:\.exe)?\s+-m\s+http\.server\b/i.test(segment) && !input.cwdUnknown) {
+    if (strictness === "LOOSE" && !hasDynamicShellExpansion(segment, input.shell)) {
+      return { verdict: "ALLOW", rules: ["operation.dev-server"], reason: "Serves a local development HTTP server" }
+    }
+    return { verdict: "ASK", rules: ["operation.context-required"], reason: "Starting a local development server requires review" }
+  } else if (/^ssh-keygen\b/i.test(segment) && strictness === "LOOSE" && !input.cwdUnknown) {
+    if (!/\s-y\b|--print/.test(segment) && /\s-N\s+['""]['""]/.test(segment) && !hasDynamicShellExpansion(segment, input.shell)) {
+      return { verdict: "ALLOW", rules: ["operation.keygen"], reason: "Generates a new SSH key pair locally" }
+    }
+  }
+
+  const safeChmod = classifySafeChmod(segment, m3ctx, strictness)
+  if (safeChmod) return safeChmod
+
+  // `[ ... ]` / `test` literal test expressions (framing brackets are not globs here)
+  const bracketMatch = segment.match(/^\[\s+([\s\S]*?)\s*\]\s*$/) ?? ( /^test\b/i.test(segment) ? [null, segment.replace(/^test\b/i, "").trim()] : null )
+  if (bracketMatch && !input.cwdUnknown) {
+    const inner = bracketMatch[1] ?? ""
+    if (commandSubstitutionBodies(segment).length === 0 && !hasUnquotedExpansion(inner, input.shell)) {
+      return { verdict: "ALLOW", rules: ["operation.test-expression"], reason: "Evaluates a literal shell test expression" }
+    }
+  }
+
+  // Command substitution whose inner reads are entirely safe: `echo $(date)` etc.
+  const substitutionBodies = commandSubstitutionBodies(segment)
+  if (
+    substitutionBodies.length > 0 &&
+    !input.cwdUnknown &&
+    isSafeSubstitutionSurface(segment, input.shell, m3ctx)
+  ) {
+    const maskedOuter = maskCommandSubstitutions(segment)
+    const substitutionFinding = analyzeSegmentPaths(maskedOuter, m3ctx)
+    if (substitutionFinding.kind === "pass") {
+      return {
+        verdict: "ALLOW",
+        rules: ["operation.command-substitution"],
+        reason: "Command substitution contains only recognized safe operations",
+      }
+    }
+  }
+
+  // heredoc: `cat <<EOF` (stdout) or `cat <<EOF > worktree-file`
+  if (/^cat\b[^\n]*<<-?["']?[A-Za-z0-9_]+/i.test(segment) && !input.cwdUnknown) {
+    const newline = segment.indexOf("\n")
+    const header = newline === -1 ? segment : segment.slice(0, newline)
+    const headerCmd = header.replace(/<<-?\s*(?:'[^']*'|"[^"]*"|\w+)\s*/g, " ")
+    const heredocFinding = analyzeSegmentPaths(headerCmd, m3ctx)
+    if (heredocFinding.kind === "pass") {
+      return { verdict: "ALLOW", rules: ["operation.heredoc"], reason: "Writes recognized heredoc content to stdout or a working-tree file" }
+    }
+    return { verdict: heredocFinding.kind === "deny" ? "DENY" : "ASK", rules: [heredocFinding.rule], reason: heredocFinding.reason }
+  }
+
+  const ansiSurfaces = decodeAnsiCContent(segment)
+  const varSurface = substituteDeleteVars(segment)
+  const quoteSurface = quoteStrippedDeleteSurface(segment)
+  const surfaces = [
+    segment,
+    ...extractDecodedPayloads(segment),
+    ...extractQuotedWrappers(segment),
+    ...ansiSurfaces,
+    ...(varSurface ? [varSurface] : []),
+    ...(quoteSurface ? [quoteSurface] : []),
+  ]
   const combined = surfaces.map(maskHeredocBody).join("\n\n")
   const reviewSignals = new Map<string, string>()
-  const explicitDisposableCleanup = isExplicitDisposableCleanup(segment) && surfaces.length === 1
+  // A quote-stripped variant of THIS same segment (`Remove-Item -LiteralPath
+  // ".\dist" -Recurse -Force` unquotes to the identical delete invocation) is
+  // not an evasion surface, so it must not suppress disposable-cleanup
+  // recognition. Any other extra surface (decoded payload, wrapped payload,
+  // ANSI, variable substitution) still denies the exemption.
+  const quoteSurfaceOfThisSegment = quoteStrippedDeleteSurface(segment)
+  const onlyInnocentSurfaces =
+    surfaces.length === 1 ||
+    (surfaces.length === 2 && quoteSurfaceOfThisSegment !== undefined && surfaces[1] === quoteSurfaceOfThisSegment)
+  const explicitDisposableCleanup =
+    isExplicitDisposableCleanup(segment, base, input.worktree) && onlyInnocentSurfaces
 
-  const knownSafe = isKnownSafeSegment(segment)
+  const knownSafe = isKnownSafeSegment(stripOutputRedirects(segment) ?? segment)
   const hasExpansion = hasDynamicShellExpansion(segment, input.shell)
-  if (knownSafe && !hasExpansion && !hasFileWritePrimitive(segment)) {
+  const provablySafe =
+    knownSafe &&
+    !hasExpansion &&
+    !hasUnquotedExpansion(maskHeredocBody(segment), input.shell) &&
+    !hasSensitiveEnvPrefix(segment)
+
+  // Kernel-trigger / core_pattern writs must not be masked by the
+  // provably-safe early allow (e.g. `echo '|/bin/evil' > /proc/sys/kernel/core_pattern`).
+  // Other DEFINITE rules keep running after EXIT-1 so that harmless echo/printf of
+  // delete strings (`echo 'rm -rf /'`) are not misclassified as deletions.
+  for (const ruleId of ["filesystem.kernel-trigger", "filesystem.kernel-core-pattern"]) {
+    const rule = SECURITY_SIGNAL_RULES.find((entry) => entry.id === ruleId)
+    if (rule && rule.test(combined)) {
+      return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
+    }
+  }
+
+  if (provablySafe) {
+    const finding = analyzeSegmentPaths(segment, { cwd: base, worktree: input.worktree, strictness })
+    if (finding.kind === "pass") {
+      return {
+        verdict: "ALLOW",
+        rules: ["operation.known-safe"],
+        reason: "The segment is a recognized read-only or normal low-risk development action",
+      }
+    }
     return {
-      verdict: "ALLOW",
-      rules: ["operation.known-safe"],
-      reason: "The segment is a recognized read-only or normal low-risk development action",
+      verdict: finding.kind === "deny" ? "DENY" : "ASK",
+      rules: [finding.rule],
+      reason: finding.reason,
     }
   }
 
@@ -2456,6 +3592,16 @@ async function classifySegment(
       reviewSignals.set(rule.id, rule.reason)
     }
   }
+
+  const compressionFinding = compressionDestructionFinding(segment, {
+    cwd: base,
+    worktree: input.worktree,
+    strictness,
+  })
+  if (compressionFinding) {
+    return { verdict: compressionFinding.verdict, rules: compressionFinding.rules, reason: compressionFinding.reason }
+  }
+
   if (hasCriticalDataDestruction(combined)) {
     return {
       verdict: "DENY",
@@ -2484,6 +3630,39 @@ async function classifySegment(
       "Attempts in-place destructive modification of durable structured data",
     )
   }
+  const sensitivePath = sensitivePathFinding(segment, { cwd: base, worktree: input.worktree, strictness })
+  if (sensitivePath && sensitivePath.kind !== "pass") {
+    return {
+      verdict: sensitivePath.kind === "deny" ? "DENY" : "ASK",
+      rules: [sensitivePath.rule],
+      reason: sensitivePath.reason,
+    }
+  }
+
+  const exfilRule = hasExfilOrDangerousPerms(segment, combined, {
+    cwd: base,
+    worktree: input.worktree,
+    strictness,
+  })
+  if (exfilRule) {
+    const reason = exfilRule === "permissions.sensitive-mode"
+      ? "Setting dangerous permissions on a credential or system file requires review"
+      : "Sending credential or system data off-host requires review"
+    if (strictness === "HARD") {
+      return { verdict: "DENY", rules: [exfilRule], reason }
+    }
+    reviewSignals.set(exfilRule, reason)
+  }
+
+  for (const rule of HARD_DENY_LOOSE_ASK_RULES) {
+    if (rule.test(combined)) {
+      if (strictness === "HARD") {
+        return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
+      }
+      reviewSignals.set(rule.id, rule.reason)
+    }
+  }
+
   if (explicitDisposableCleanup && strictness !== "HARD") {
     return {
       verdict: "ALLOW",
@@ -2541,14 +3720,6 @@ async function classifySegment(
       verdict: "ASK",
       rules: ["operation.context-required"],
       reason: "The command performs a process, network, installation, privilege, or overwrite operation requiring review",
-    }
-  }
-
-  if (isKnownSafeSegment(segment)) {
-    return {
-      verdict: "ALLOW",
-      rules: ["operation.known-safe"],
-      reason: "The segment is a recognized read-only or normal low-risk development action",
     }
   }
 
@@ -2673,6 +3844,40 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     }
   }
   const executableSurfaces = [source, ...extractDecodedPayloads(source), ...extractQuotedWrappers(source)]
+  // Pipe-separated segments are classified individually, so remote-pipe
+  // (`curl ... | bash`) must be judged on the full script. HARD mode denies
+  // download-and-execute outright; LOOSE defers it to the dynamic reviewer
+  // (which applies the official-installer rule).
+  const remotePipeRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.remote-pipe")
+  if ((input.strictness ?? "LOOSE") === "HARD" && remotePipeRule && remotePipeRule.test(source)) {
+    return {
+      verdict: "DENY",
+      rules: ["execution.remote-pipe"],
+      reason: remotePipeRule.reason,
+      fingerprints: [],
+    }
+  }
+  // Reverse shells / xargs deletion may span `|`/`;` segments, so judge them
+  // on the full script (both modes: these are DEFINITE-destructive).
+  const reverseShellRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "network.reverse-shell")
+  const xargsRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.xargs-destructive")
+  for (const rule of [reverseShellRule, xargsRule]) {
+    if (rule && rule.test(source)) {
+      return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+    }
+  }
+  // Literal piped into a shell interpreter: `printf 'rm -rf /' | sh`.
+  const literalShell = /(?:echo|printf)\s+["'][^"']{1,200}?(?:\brm\b[^\n;|"'&]*-[rf]|\bshred\b|\brm\s+-rf\b)[^"']*["']\s*\|\s*(?:sh|bash|zsh|dash)\b/i.test(
+    source,
+  )
+  if (literalShell) {
+    return {
+      verdict: "DENY",
+      rules: ["execution.literal-shell"],
+      reason: "Pipes a destructive literal command into a shell interpreter",
+      fingerprints: [],
+    }
+  }
   const localScriptSurfaces: string[] = []
   const fingerprints: ScriptFingerprint[] = []
   const localScripts: LocalScriptReviewContext[] = []
@@ -2737,7 +3942,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   }
 
   if (
-    isExplicitDisposableCleanup(source) &&
+    isExplicitDisposableCleanup(source, input.cwd, input.worktree) &&
     executableSurfaces.length === 1 &&
     localScriptSurfaces.length === 0 &&
     (input.strictness ?? "LOOSE") !== "HARD"

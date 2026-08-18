@@ -2,7 +2,22 @@
 
 [English](README.md)
 
-0.4.2 版本——面向 OpenCode 原生 `bash` 工具的“执行边界”命令安全分类器。
+0.5.1 版本——面向 OpenCode 原生 `bash` 工具的“执行边界”命令安全分类器。
+
+## 0.5.0 / 0.5.1 更新内容（安全加固）
+
+0.5.1 与 v2 分支（`0.5.1-v2`）同步：修复了 LOOSE 下 `rmdir -Recurse -Force` 强制递归删除漏洞，并恢复两条 PowerShell 可弃清理的白名单。0.5.0 是 opencode v2 构建中所包含 M1–M4 安全加固的 v1 移植版（细节见仓库内 `bash-classifier-fix-plan.md` / `bash-classifier-exploits.md` 及 `CHANGELOG.md`）。静态分类器从“命令名在白名单 ⇒ 安全”升级为**“可证明安全”**（对齐 Claude Code `pathValidation.ts` / Codex CLI 的 fail-closed 设计）：
+
+- **路径安全层**（新增 `src/security/paths.ts`）：对白名单命令的每个读写文件参数做 `--` 感知抽取并对照敏感路径注册表。读取 `/etc/shadow`、`base64 ~/.ssh/id_rsa`、`cat ~/.kube/config`、`git add .env` → **LOOSE ASK / HARD DENY**；写 system-write/credential 路径（`> /etc/passwd`、`chmod`、`tee`、外泄汇点）→ **LOOSE ASK / HARD DENY**；工作树内非敏感写入现在 **ALLOW**。
+- **可证明安全守卫**：未加引号的 `$`/反引号/glob/花括号展开，以及敏感内联 env 前缀（`PATH=...`、`LD_*`、`DYLD_*`、`PYTHONPATH`、`BASH_ENV` 等）会让该段失去静态 `ALLOW`（fail-closed → ASK）。
+- **区域断言验证**：disposable / 回收站 / backup-copy 的白名单现在要求每个目标在词法上确证位于工作树或可信 temp 内（无 `..`、无 glob/变量）。
+- **M2 破坏性规则**：find 根删除、fork bomb、设备/磁盘写、内核接口（`/proc/sysrq-trigger`、`core_pattern`）、反向 shell、`curl|bash`、脚本一行式（`python -c 'rmtree("/")'`）、外泄、压缩破坏、`chmod`/setuid、防火墙清理、内核模块加载与 WSL 载荷——并附带引号剥离、brace、ANSI-C 与变量间接等表面。
+- **TOCTOU**：本地脚本指纹现在同时记录链接身份（`dev/ino/mtime` + 规范路径）并在执行前复验，堵住符号链接换链窗口。
+- **动态审阅器**：thinking 块抑制（`chat_template_kwargs.enable_thinking`、`_strip_thinking`）、429 指数退避 ×2 / 5xx ×1 重试、加固后的 LOOSE/HARD 提示词与“静态层自足”声明。`PROMPT_VERSION` 升至 v2，旧缓存条目失效。
+- **M3 可用性 + 安全网**：HARD 现在允许删除工作树内可弃目录（`node_modules`、`dist`、`build`、`coverage`、`target`、`.cache`、`.venv`、`.next`、`out`、`.gradle`、`__pycache__` 等）的 `rm -rf`；工作树内安全重定向、下载到工作树的 https、`make clean`、`crontab -l`、`pip uninstall` 等静态放行——全部位于路径层 + 扩展守卫之前。
+- **M4 效率**：对已知只读模式（`docker logs <name>`、`kubectl logs|get|describe <pod>`、只读 `psql -c`）做动态 ALLOW 缓存键归一化。
+
+行为变更是有意为之：部分原先 `ASK` 的命令现在是静态 `DENY`（敏感读/写、破坏性一行式），部分原先 `ASK` 的命令现在是静态 `ALLOW`（工作树写、可弃清理、只读巡检）。任何敏感或破坏性场景均未引入 `DENY→ALLOW` 的放宽。
 
 ## 概述
 
@@ -105,7 +120,7 @@ LOOSE 假定使用者是一位善意的开发者，其目标是防止持久化�
 
 ### HARD —— 最严格，无任何放宽
 
-- 所有强制递归删除（`rm -rf`、`Remove-Item -Recurse -Force` 及等价的标志组合）都会被静态 `DENY`。
+- 所有强制递归删除都会被静态 `DENY`，**唯一例外**是 M3 可弃目录豁免：`rm -rf`（及等价形式）删除工作树内可识别可弃目录（`node_modules`、`dist`、`build`、`coverage`、`target`、`.cache`、`.venv`、`.next`、`.turbo`、`.nuxt`、`__pycache__`、`.pytest_cache`、`out`、`.gradle`）——字面目标、无 `..`/glob/变量——为 `ALLOW`。PowerShell 的 `rmdir -Recurse -Force` 别名形式**不在**豁免内，仍为 `DENY`。
 - HARD 模式下**没有** temp/tmp、本地临时目录或备份例外；删除任何指定名称的临时目录、本地临时目录或备份目标都会被拒绝。
 - 持久化数据文件的永久删除**或移入回收站**都会被拒绝；其余真实的回收站移动会被静态放行——移入操作系统回收站是可恢复操作，无需再占用动态审查。
 - 清空回收站、彻底删除或直接删除回收站内部条目会被拒绝。

@@ -2,7 +2,22 @@
 
 [简体中文](README.zh-CN.md)
 
-Version 0.4.2 — an execution-boundary command safety classifier for OpenCode's native `bash` tool.
+Version 0.5.1 — an execution-boundary command safety classifier for OpenCode's native `bash` tool.
+
+## What's new in 0.5.0 / 0.5.1 (security hardening)
+
+0.5.1 syncs the v2 branch (`0.5.1-v2`) with the v1 fixes: it closes the `rmdir -Recurse -Force` forced-recursive hole in LOOSE and restores two PowerShell disposable-cleanup allowances. See the 0.5.0 section below and `CHANGELOG.md` for the full 190-finding hardening (M1–M4, documented in `bash-classifier-fix-plan.md` / `bash-classifier-exploits.md` in the repo).
+
+- **Path safety layer** (new `src/security/paths.ts`): every read/write file argument of whitelisted commands is extracted (`--` aware) and checked against a sensitivity registry. Reading `/etc/shadow`, `base64 ~/.ssh/id_rsa`, `cat ~/.kube/config`, `git add .env` → **LOOSE ASK / HARD DENY**; writing system-write/credential paths (`> /etc/passwd`, `chmod`, `tee`, data exfiltration sinks) → **LOOSE ASK / HARD DENY**; writes inside the working tree (non-sensitive) are now **ALLOW**.
+- **Provably-safe guard**: unquoted `$`/`` ` ``/glob/brace expansion, and sensitive inline env prefixes (`PATH=... , LD_*, DYLD_*, PYTHONPATH, BASH_ENV`, ...) disqualify a segment from static `ALLOW` (fail-closed → ASK).
+- **Area assertions verified**: disposable / recycle-bin / backup-copy allowances now confirm every target lexically resolves (no `..`, no glob/var) inside the worktree or trustable temp.
+- **M2 destructive rules**: find root-delete, fork bombs, device/disk writes, kernel triggers (`/proc/sysrq-trigger`, `core_pattern`), reverse shells, `curl|bash`, script one-liners (`python -c 'rmtree("/")'`), exfiltration, compression-destruction, `chmod`/setuid, firewall flush, kernel-module load, and WSL payloads — with quote-stripping, brace, ANSI-C and variable-indirection surfaces.
+- **TOCTOU**: local-script fingerprints now also record the link identity (`dev/ino/mtime` + canonical path) and re-verify it before execution, closing the symlink-swap window.
+- **Dynamic reviewer**: thinking-block suppression (`chat_template_kwargs.enable_thinking`, `_strip_thinking`), 429 exponential-backoff ×2 / 5xx ×1 retries, hardened LOOSE/HARD prompts, and a static-layer-self-sufficiency declaration. `PROMPT_VERSION` bumped to v2 so stale cache entries are not reused.
+- **M3 usability with safety net**: HARD now allows `rm -rf` of in-worktree disposable dirs (`node_modules`, `dist`, `build`, `coverage`, `target`, `.cache`, `.venv`, `.next`, `out`, `.gradle`, `__pycache__`, ...); safe in-worktree redirects, https downloads to the worktree, `make clean`, `crontab -l`, `pip uninstall`, and more are statically allowed — all with the path layer + expansion guard in front.
+- **M4 efficiency**: dynamic-ALLOW cache keys are normalized for known read-only patterns (`docker logs <name>`, `kubectl logs|get|describe <pod>`, read-only `psql -c`).
+
+Behavior changes are intentional: some previously-`ASK` commands are now static `DENY` (sensitive reads/writes, destructive one-liners), and some previously-`ASK` commands are now static `ALLOW` (worktree writes, disposable cleanup, read-only inspection). No `DENY→ALLOW` relaxation was introduced for anything sensitive or destructive.
 
 ## Overview
 
@@ -105,7 +120,7 @@ LOOSE assumes a well-intentioned developer and exists to prevent accidental, irr
 
 ### HARD — strictest, no relaxations
 
-- All forced recursive deletions (`rm -rf`, `Remove-Item -Recurse -Force`, and equivalent flag combinations) are statically `DENY`.
+- All forced recursive deletions are statically `DENY` **except** the M3 disposable-dir exemption: `rm -rf` (and equivalent) of a recognized in-worktree disposable directory (`node_modules`, `dist`, `build`, `coverage`, `target`, `.cache`, `.venv`, `.next`, `.turbo`, `.nuxt`, `__pycache__`, `.pytest_cache`, `out`, `.gradle`) — literal, no `..`/glob/var — is `ALLOW`. The PowerShell `rmdir -Recurse -Force` alias form is *not* exempt and stays `DENY`.
 - There is **no** temp/tmp, Local Temp, or backup exception in HARD mode; deleting any named temp, Local Temp, or backup target is denied.
 - Permanently deleting **or moving to the recycle bin** a durable data file is denied; other genuine recycle-bin moves are statically allowed — moving an item to the OS recycle bin is recoverable and no longer consumes a dynamic review.
 - Emptying, purging, or directly deleting items inside the recycle bin is denied.
@@ -302,9 +317,8 @@ The release executable (`bash.exe`, named so OpenCode keeps Bash-specific argume
 
 ```bash
 bun run build          # build the plugin to ./dist
-bun run check          # build + unit tests + auditor Python tests
-bun run test:auditor   # Python tests for the auditor's read-only tools
-bun run test:supervisor  # native supervisor integration test (requires a built supervisor)
+bun run check          # build (alias)
+bun run build:supervisor  # build the native Windows process supervisor (cargo)
 ```
 
-Note: the `test/` directory is listed in `.gitignore`; already tracked tests remain in a clone, while any newly added test file must be force-added explicitly before commit. The supervisor integration test additionally requires a built supervisor binary.
+The repository is intentionally kept clean for publishing: no committed test suite and no build caches. Test locally before a release and keep those files out of commits.

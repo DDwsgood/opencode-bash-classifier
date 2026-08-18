@@ -18,8 +18,6 @@ test/
 .env
 .env.local
 .env.*.local
-# Dummy fixture used by the backup-policy tests (not a real secret)
-!test/fixtures/backup-policy/.env
 
 # opencode local state
 .opencode/

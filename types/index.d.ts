@@ -7,6 +7,16 @@ export type ScriptFingerprint = {
   size: number
   mtimeMs: number
   sha256: string
+  /**
+   * Present when the executed path was a symlink at classification time.
+   * `verifyScriptFingerprints` re-checks the link identity (dev/ino/mtime) and
+   * that it still resolves to the same canonical file, closing the
+   * symlink-swap TOCTOU window (v0.5.0).
+   */
+  linkPath?: string
+  linkDev?: number
+  linkIno?: number
+  linkMtimeMs?: number
 }
 
 export type LocalScriptReviewContext = {
