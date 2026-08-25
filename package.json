@@ -12,6 +12,8 @@
   },
   "files": [
     "src",
+    "!src/**/__pycache__",
+    "!src/**/*.pyc",
     "native/windows-bash-supervisor/README.md",
     "native/windows-bash-supervisor/Cargo.toml",
     "native/windows-bash-supervisor/Cargo.lock",
