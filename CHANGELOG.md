@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.6.0-v2 (2026-08-26)
+## 0.6.1-v2 (2026-08-26)
 
 Comprehensive audit round (attack-surface gap analysis + adversarial LLM probing of
 DeepSeek-V4-Flash and GLM on an OpenAI-compatible gateway). Findings and fixes:
