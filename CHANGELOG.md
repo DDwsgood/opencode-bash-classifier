@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.6.0-v2 (2026-08-26)
+
+Comprehensive audit round (attack-surface gap analysis + adversarial LLM probing of
+DeepSeek-V4-Flash and GLM on an OpenAI-compatible gateway). Findings and fixes:
+
+### Fixed
+- **Security (`git.remote-history-rewrite`)**: force-push / mirror push / remote
+  branch & tag deletion / `update-ref` / `filter-branch`/`filter-repo` are now
+  DEFINITE DENY in both policies (previously only an ASK signal, and several
+  shapes — `--mirror`, `--delete`, `-C` prefix, delete-refspec — fell through to
+  plain `operation.unknown`). `--force-with-lease` stays an ASK signal.
+- **Security (`filesystem.root-glob-delete`)**: `rm -rf /*`, `rm -rf /etc*` and
+  other absolute glob forced deletes are DENY (temp-area globs exempted).
+- **Security (git hooks)**: writing into `/.git/hooks/` is ASK (LOOSE) / DENY
+  (HARD); previously `cp evil.sh .git/hooks/pre-commit && chmod +x … && git commit`
+  ran planted hooks through a fully ALLOWed chain.
+- **Security (PowerShell pipeline delete)**: `… | Remove-Item` joins the
+  destructive-pipeline rule (previously only `… | xargs …` was caught).
+- **Security (at/systemd-run persistence)**: one-shot at/systemd-run timers join
+  the persistence review signal.
+- **Cache (dynamic-review poisoning)**: the psql cache-key normalizer no longer
+  collapses `begin`/`prepare`/`values`/`with` SQL, and `select`/`show`/`describe`/
+  `explain`/`vacuum`/`analyze` payloads are only collapsed when they contain no
+  write keyword and no known side-effecting function. Previously a cached ALLOW
+  for `psql -c "select 1"` was reused for `insert`/`prepare`/`pg_terminate_backend`
+  payloads without review.
+- **Security (local-script exfil)**: `hasExfilOrDangerousPerms` now also runs
+  against inspected script content, so `bash script.sh` containing `curl -T` /
+  `scp` uploads of sensitive data surfaces a review signal instead of ALLOW.
+- **Security (named temp under /tmp worktrees)**: the named-temp whitelist no
+  longer fires for every delete when the worktree itself lives under `/tmp` or
+  contains a `tmp`/`temp` directory segment contributed by the worktree prefix.
+- **FP (disposable cleanup)**: the disposable-directory whitelist now accepts
+  quoted targets, long/split flag spellings, nested/ancestor paths
+  (`some/pkg/node_modules`, `node_modules/.cache/puppeteer`, `src/generated`),
+  brace-expanded targets, and additional generated-artifact names
+  (venv, .tox, .mypy_cache, .ruff_cache, .nyc_output, .parcel-cache,
+  .sass-cache, storybook-static, playwright-report, test-results, .angular,
+  .dart_tool, htmlcov, .eggs).
+- **FP (HARD inert echo)**: `echo 'rm -rf /'` no longer trips the HARD
+  forced-recursive-delete deny.
+- **FP (git clean flag order)**: `git clean -xdf` / `-dfx` are now matched
+  regardless of flag order.
+- **Budget (`slowCommands`, new option, default on)**: safe-but-wasteful commands
+  — unbounded scans of system/mounted trees (`find`/`du`/`grep -r`/`rg`/`ls -R`
+  over `/`, `/mnt/*`, `/home`, `/usr`, …), streaming commands (`tail -f`,
+  `journalctl -f`, `docker/kubectl logs -f`, `watch`, unsteady `ping`/`tcpdump`,
+  bare `yes`), and `sleep` at or beyond the 120-second default threshold — are
+  DENYed statically with bound-it guidance, unless the caller passes an
+  explicit timeout parameter.
+
+### Cache (P2)
+- **Global cross-session cache**: cache keys no longer carry the session ID —
+  the payload already pins every security-relevant context (script, cwd, shell,
+  static rules, fingerprints, directory listings, referenced paths, strictness,
+  endpoint, model, prompt version), so identical contexts reuse a verdict across
+  sessions. Allow-TTL reduced 30min → 15min to bound staleness.
+- **Negative cache (90s)**: dynamic DENY results are replayed for 90 seconds so
+  a stubborn model retrying the same denied command stops burning review calls.
+- **In-flight dedup**: concurrent identical reviews share one auditor call.
+- **Normalizer coverage**: `docker logs --tail N <id>` / `-n` / `--since` / `-q`
+  / `-f` and `kubectl logs [-f] [-c container] <pod>` now share one cache entry
+  with their bare forms.
+
+### Hardening (P3)
+- **`sed -i` durable-data overwrite** no longer rides the provably-safe early
+  allow: `sed -i … file.csv|.json|.db|.sqlite|.xlsx|.parquet` is ASK.
+- **Brace-expanded disposable cleanup**: `rm -rf src/{dist,output}` is ALLOWed
+  when every expansion is an eligible disposable path inside the worktree.
+- **Cross-segment variable tracking**: `D=rm; $D -rf ~/x` classifies the
+  substituted surface too and keeps the worse verdict (now DENY).
+- **Auditor transport resilience**: `_post_chat` retries fast-failing network
+  errors (TLS/proxy resets) once within budget; 429 honors `Retry-After` and
+  5xx retries with backoff, while other 4xx (auth/client errors) never retry.
+  The prompt-injection detector separately retries 403 gateway jitter.
+
+### Considered, intentionally not changed
+- `git reset --hard` / `git checkout -- .` stay ASK signals: the dynamic layer
+  denies them reliably, and a static DEFINITE deny would break routine
+  discard-experimental-changes workflows.
+
+### Auditor prompts (DeepSeek-oriented)
+- LOOSE/HARD prompts now deny shared remote Git history rewriting explicitly.
+- History clearing / history-file deletion is DENY in LOOSE (was a carve-out the
+  model over-applied).
+- Process termination is calibrated: PID- or scoped-`pkill` for the user's own
+  dev process is ALLOW; broad/system termination is DENY.
+- LOOSE adds slow-command guidance mirroring the static rule.
+
+### Plugin shape (effect migration)
+- **Effect plugin form**: the plugin is now `{ id, effect(ctx) }` whose `effect`
+  returns an `Effect.Effect` (was the promise `{ id, setup(ctx) }`). Hook
+  callbacks return `Effect`s: `execute.before` blocks route through
+  `Effect.tryPromise`'s `catch` as a single-call typed `Tool.Error` failure
+  (`catchTag("Tool.Error")` discriminates by `_tag`, so the rejection object
+  need not be a real `Tool.Error` instance), `execute.after` swallows errors
+  (`Effect.catchAll`), `shell.create.before` is `Effect.sync`, and the
+  `session.deleted` consumer is `Stream.runForEach` + `Effect.forkScoped` tied
+  to the plugin scope. `ctx.session.*` Effects run against the host-provided
+  runtime captured inside `effect` (not a bare `Effect.runPromise`).
+- **Fail-close protocol routing + injection detector**: under HARD, a
+  protocol-class `ReviewError` (oversized payload, bad auditor shape/exit) is an
+  **unconditional fail-close** regardless of `failPolicy`; under LOOSE every
+  review failure — protocol or infra — honors the configured `failPolicy`
+  (the auditor never enforces mandatory inspection under LOOSE). An infra-class
+  error or unknown non-`ReviewError` honors `failPolicy` in both modes. On HARD
+  + protocol with a configured
+  reviewer endpoint, the prompt-injection detector is tripped: `injection:true`
+  blocks + interrupts the session (with a `resume:false` synthetic warning);
+  detector failure (`undefined`) fail-closes with a note; `false` still
+  fail-closes (a protocol violation always denies). HARD bypass/abort timing
+  fixed: the interrupt is fire-and-forget-delayed so the block message stays
+  the visible outcome (was rewritten to STEP_INTERRUPTED when it landed first).
+- **hardTimeoutMs no longer overrides background**: the `hardTimeoutMs`
+  injection in `applyPostChecks` is skipped when `input.background === true`
+  (v2 background runs have no default timeout and would otherwise be
+  force-killed).
+
 ## 0.5.1-v2 (2025-08-18)
 
 Synchronized with the v1 branch (`0.5.1`): the classifier and auditor sources are byte-identical to v1.

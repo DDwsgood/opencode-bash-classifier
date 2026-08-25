@@ -14,6 +14,7 @@ import {
   sensitivePathFinding,
   segmentCommandLeaf,
   stripOutputRedirects,
+  stripTrailingFdMerges,
   type PathContext,
 } from "./paths"
 
@@ -87,7 +88,7 @@ type InternalClassifyInput = ClassifyShellCommandInput & {
   cwdUnknown?: boolean
 }
 
-const MAX_COMMAND_CHARS = 128_000
+const MAX_COMMAND_CHARS = 32_768
 const MAX_LOCAL_SCRIPT_BYTES = 256_000
 const MAX_CLOUD_LOCAL_SCRIPT_CHARS = 256_000
 const MAX_LOCAL_SCRIPTS = 8
@@ -236,16 +237,51 @@ async function canonicalProjectedPath(candidate: string) {
   return undefined
 }
 
-async function isNamedTempTargetResolved(target: string, base: string | undefined) {
+/**
+ * Removes the worktree prefix from a canonical path so named-temp checks judge
+ * only the target's own segments. Without this, a worktree that itself lives
+ * under /tmp (sandboxes, scratch projects) contributes a `tmp` segment to every
+ * candidate and the whole whitelist fires for arbitrary deletes.
+ */
+async function withoutWorktreePrefix(canonical: string, worktree: string | undefined): Promise<string> {
+  if (!worktree) return canonical
+  const bases = [path.resolve(worktree)]
+  try {
+    bases.push(await realpath(path.resolve(worktree)))
+  } catch {
+    // Lexical worktree path only.
+  }
+  const norm = canonical.replaceAll("\\", "/")
+  for (const base of bases) {
+    const b = base.replaceAll("\\", "/").replace(/\/+$/, "")
+    if (b && norm.toLowerCase() === b.toLowerCase()) return ""
+    if (b && norm.toLowerCase().startsWith((b + "/").toLowerCase())) return norm.slice(b.length + 1)
+  }
+  return norm
+}
+
+async function isNamedTempTargetResolved(target: string, base: string | undefined, worktree?: string) {
   if (base === undefined) return false
   const literal = literalPathToken(target)
   if (!literal) return false
   const cleaned = literal.replaceAll("\\", "/")
   if (cleaned.split("/").some((segment) => segment === "..")) return false
   const lexical = normalizeMsysPath(path.resolve(normalizeMsysPath(base), cleaned))
-  if (!hasNamedTempPathSegment(lexical)) return false
+  const lexicalOwn = await withoutWorktreePrefix(lexical, worktree)
+  if (!hasNamedTempPathSegment(lexicalOwn)) {
+    // The target carries no temp segment of its own; accept it only when it
+    // resolves OUTSIDE the worktree into a real temp location.
+    const outside = await canonicalProjectedPath(lexical)
+    if (!outside || !hasNamedTempPathSegment(outside) || isWithin(worktree ?? base, outside)) return false
+    // Prevent symlink escape: lexical path within worktree that resolves outside
+    if (isWithinLexical(worktree ?? base, lexical)) return false
+    return true
+  }
   const canonical = await canonicalProjectedPath(lexical)
-  return Boolean(canonical && hasNamedTempPathSegment(canonical))
+  if (!canonical) return false
+  // Prevent symlink escape: lexical path within worktree that resolves outside
+  if (isWithinLexical(worktree ?? base, lexical) && !isWithin(worktree ?? base, canonical)) return false
+  return hasNamedTempPathSegment(await withoutWorktreePrefix(canonical, worktree))
 }
 
 function isRedirectToken(token: string): boolean {
@@ -297,10 +333,61 @@ function findDangerousDeleteRoot(text: string): boolean {
 
 function hasForkBomb(text: string): boolean {
   const stripped = text.replace(/["']/g, "")
-  if (/(?:^|[;&\s]):\s*\(\s*\)\s*\{[^{}]*\|\s*:\s*&?[^{}]*\}[\s;&]*:/.test(stripped)) return true
-  if (/([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\{[^{}]*\|\s*\1\s*&?[^{}]*\}[\s;&]*\1/.test(stripped)) return true
+  // Linear scan for name(){ ...|...name...&... }...name fork-bomb patterns.
+  const nameChars = /[\w:.*-]/
+  let pos = 0
+  for (;;) {
+    const parenIdx = stripped.indexOf("(", pos)
+    if (parenIdx === -1) break
+    pos = parenIdx + 1
+    if (stripped[parenIdx + 1] !== ")") continue
+    let nameEnd = parenIdx
+    while (nameEnd > 0 && /[\s]/.test(stripped[nameEnd - 1])) nameEnd -= 1
+    let nameStart = nameEnd
+    while (nameStart > 0 && nameChars.test(stripped[nameStart - 1])) nameStart -= 1
+    const name = stripped.slice(nameStart, nameEnd)
+    if (!name) continue
+    let braceIdx = parenIdx + 2
+    while (braceIdx < stripped.length && /[\s]/.test(stripped[braceIdx])) braceIdx += 1
+    if (braceIdx >= stripped.length || stripped[braceIdx] !== "{") continue
+    let depth = 1
+    let closeIdx = braceIdx + 1
+    while (closeIdx < stripped.length && depth > 0) {
+      if (stripped[closeIdx] === "{") depth += 1
+      else if (stripped[closeIdx] === "}") depth -= 1
+      if (depth === 0) break
+      closeIdx += 1
+    }
+    if (depth !== 0 || closeIdx >= stripped.length) continue
+    const body = stripped.slice(braceIdx + 1, closeIdx)
+    if (!body.includes("|") || !body.includes(name)) continue
+    if (body.includes("&")) return true
+    const after = stripped.slice(closeIdx + 1).replace(/^[\s;&]*/, "")
+    if (after.startsWith(name)) return true
+  }
   if (/\bwhile\s+(?:true|1|:|\[[^\]]*\])\b[^;]*;\s*do\s+[^;]*\$0\s*&/.test(stripped)) return true
-  if (/(?:^|[;&\s])([A-Za-z0-9_.:*-]+)\s*\|\s*\1\s*&/.test(stripped)) return true
+  // pipe self-reference: name | name & (linear scan, no backreference)
+  let pipePos = 0
+  for (;;) {
+    const pipeIdx = stripped.indexOf("|", pipePos)
+    if (pipeIdx === -1) break
+    pipePos = pipeIdx + 1
+    let leftEnd = pipeIdx
+    while (leftEnd > 0 && /[\s]/.test(stripped[leftEnd - 1])) leftEnd -= 1
+    let leftStart = leftEnd
+    while (leftStart > 0 && nameChars.test(stripped[leftStart - 1])) leftStart -= 1
+    const leftName = stripped.slice(leftStart, leftEnd)
+    if (!leftName) continue
+    let rightStart = pipeIdx + 1
+    while (rightStart < stripped.length && /[\s]/.test(stripped[rightStart])) rightStart += 1
+    let rightEnd = rightStart
+    while (rightEnd < stripped.length && nameChars.test(stripped[rightEnd])) rightEnd += 1
+    const rightName = stripped.slice(rightStart, rightEnd)
+    if (!rightName || leftName !== rightName) continue
+    let afterIdx = rightEnd
+    while (afterIdx < stripped.length && /[\s]/.test(stripped[afterIdx])) afterIdx += 1
+    if (afterIdx < stripped.length && stripped[afterIdx] === "&") return true
+  }
   return false
 }
 
@@ -322,16 +409,23 @@ function commandTokenUnquote(token: string): string {
   return token.replace(/^(["'])([\s\S]*)\1$/, "$2")
 }
 
+/** Conservative unescape/quote-removal for command name matching only (`r'm'`, `r\m`, `"r"m` → `rm`). */
+function normalizeCommandNameToken(token: string): string {
+  return token.replace(/['"\\]/g, "")
+}
+
 /**
  * Re-surfaces a segment whose first token, after removing quotes, is a
- * destructive command, so `'rm' -rf /` / `rm '-rf' /` are caught without
- * flagging `echo 'rm -rf /'`.
+ * destructive command, so `'rm' -rf /` / `rm '-rf' /` / `r'm' -rf /` / `r\m -rf /`
+ * are caught without flagging `echo 'rm -rf /'`.
  */
 function quoteStrippedDeleteSurface(segment: string): string | undefined {
-  const tokens = simpleInvocationTokens(segment.trim())
-  if (tokens.length === 0) return undefined
-  const first = commandTokenUnquote(tokens[0] ?? "")
-  const leaf = first
+  const trimmed = segment.trim()
+  if (!trimmed) return undefined
+  const firstSpace = trimmed.search(/\s/)
+  const firstWordRaw = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace)
+  const firstWord = normalizeCommandNameToken(firstWordRaw)
+  const leaf = firstWord
     .split("/")
     .at(-1)
     ?.replace(/\.(?:exe|cmd|bat|ps1)$/i, "")
@@ -339,8 +433,10 @@ function quoteStrippedDeleteSurface(segment: string): string | undefined {
   if (!leaf || !/^(?:rm|rmdir|rd|del|erase|remove-item|ri|shred|srm|wipe|unlink)\b/.test(leaf)) {
     return undefined
   }
-  const stripped = tokens.map(commandTokenUnquote).join(" ")
-  return stripped.trim() === segment.trim() ? undefined : stripped
+  const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace)
+  const tokens = simpleInvocationTokens(rest.trim())
+  const stripped = firstWord + (tokens.length > 0 ? " " + tokens.map(commandTokenUnquote).join(" ") : "")
+  return stripped.trim() === trimmed ? undefined : stripped
 }
 
 function decodeAnsiCContent(script: string): string[] {
@@ -416,21 +512,74 @@ function hasDangerousBraceDelete(text: string): boolean {
 
 /** `D=rm; $D -rf /tmp/x` → surface with the variable substituted back. */
 function substituteDeleteVars(script: string): string | undefined {
-  const assignments = script.match(/([A-Za-z_][A-Za-z0-9_]*)=(?:rm|shred|srm|wipe|rmdir|remove-item|del|erase|unlink)\b/gi)
-  if (!assignments || assignments.length === 0) return undefined
+  const deleteCmds = ["rm", "shred", "srm", "wipe", "rmdir", "remove-item", "del", "erase", "unlink"]
   let result = script
-  for (const assignment of assignments) {
-    const name = assignment.slice(0, assignment.indexOf("="))
-    const value = assignment.slice(assignment.indexOf("=") + 1).toLowerCase()
-    if (new RegExp(`(?:^|[\\s;&|])[\\$]\\{?${name}\\}?(?=[\\s;&|])`, "i").test(script)) {
-      result = result.replace(new RegExp(`[\\$]\\{?${name}\\}?`, "g"), value)
+  let changed = false
+  let pos = 0
+  for (;;) {
+    const eq = script.indexOf("=", pos)
+    if (eq === -1) break
+    pos = eq + 1
+    let start = eq
+    while (start > 0 && /[\w]/.test(script[start - 1])) start -= 1
+    if (start === eq || !/[A-Za-z_]/.test(script[start])) continue
+    const name = script.slice(start, eq)
+    const after = script.slice(eq + 1)
+    for (const cmd of deleteCmds) {
+      if (!after.toLowerCase().startsWith(cmd)) continue
+      const nextChar = after[cmd.length]
+      if (nextChar !== undefined && /[\w]/.test(nextChar)) continue
+      if (new RegExp(`(?:^|[\\s;&|])[\\$]\\{?${name}\\}?(?=[\\s;&|])`, "i").test(script)) {
+        result = result.replace(new RegExp(`[\\$]\\{?${name}\\}?`, "g"), cmd.toLowerCase())
+        changed = true
+      }
+      break
     }
   }
-  return result === script ? undefined : result
+  return changed ? result : undefined
 }
 
 function hasTarRemoveFiles(text: string): boolean {
   return /\btar\b[^\n;]*--remove-files\b/i.test(text)
+}
+
+/**
+ * Remote Git history rewrite: force-push, mirror push, remote branch/tag
+ * deletion, low-level ref rewrites, and history filters. These change shared
+ * state beyond the machine, so they are definite denials in both policies.
+ */
+function hasGitRemoteHistoryRewrite(text: string): boolean {
+  if (/\bgit\b[^\n;|&]*\bpush\b[^\n;|&]*(?:--force(?!-with-lease)\b|--mirror\b|--delete\b|\s-[a-zA-Z]*f[a-zA-Z]*\b)/i.test(text)) return true
+  if (/\bgit\b[^\n;|&]*\bpush\b[^\n;|&]*\s:[\w.-]+/.test(text)) return true
+  // force-push refspec: +main or +refs/heads/main:refs/heads/main
+  if (/\bgit\b[^\n;|&]*\bpush\b[^\n;|&]*\s\+[^\s:]+(?::[^\s]+)?/i.test(text)) return true
+  // low-level ref rewrite (allows global options like -C, --work-tree)
+  if (/\bgit\b[^\n;|&]*\b(?:update-ref|filter-branch|filter-repo)\b/i.test(text)) {
+    if (/(?:\s|^)--help(?:\s|$)/i.test(text) || /(?:\s|^)-h(?:\s|$)/i.test(text)) return false
+    return true
+  }
+  return false
+}
+
+/** Forced deletion whose target is an absolute or home glob outside temp areas (`rm -rf /etc*`, `rm -rf ~/*`). */
+function hasRootGlobDelete(text: string): boolean {
+  const invocations =
+    text.match(/\b(?:rm|remove-item|ri|del|erase|rmdir|rd)\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
+  return invocations.some((invocation) => {
+    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    if (tokens.length < 2) return false
+    const shape = forcedRecursiveShape(tokens)
+    if (!shape.forced || shape.targets.length === 0) return false
+    return shape.targets.some((target) => {
+      const literal = stripMatchingQuotes(target).replaceAll("\\", "/").toLowerCase()
+      if (!/[*?\[]/.test(literal)) return false
+      if (literal.startsWith("/")) {
+        return !(literal === "/tmp*" || literal.startsWith("/tmp/*") || literal === "/var/tmp*" || literal.startsWith("/var/tmp/*"))
+      }
+      if (literal.startsWith("~/") || literal.startsWith("$home/")) return true
+      return false
+    })
+  })
 }
 
 /** DENY-both rules that need filesystem context: compression of sensitive files, tar --remove-files. */
@@ -474,9 +623,26 @@ function hasExfilOrDangerousPerms(segment: string, text: string, ctx: PathContex
     /(?:-d|--data|--data-binary|--data-raw)(?:=|\s+)@?(['"]?)([^\s'"=<]+)\1/gi,
     /(?:-F|--form)[^\n]*?=@(['"]?)([^\s'"]+)\1/gi,
     /--post-file(?:=|\s+)(['"]?)([^\s'"]+)\1/gi,
+    /(?:\s|^)(?:-T|--upload-file)(?:\s+|=[^\s]+)/gi,
   ]
   for (const pattern of uploadPatterns) {
-    for (const match of text.matchAll(pattern)) uploadPaths.push(match[2] ?? "")
+    for (const match of text.matchAll(pattern)) {
+      if (pattern === uploadPatterns[3]) {
+        // -T/--upload-file form: inline value or next token; skip a following URL.
+        const matchText = match[0]
+        const afterMatch = text.slice((match.index ?? 0) + matchText.length)
+        const inline = /(?:-T|--upload-file)=([^\s]+)/i.exec(matchText.trim())
+        if (inline) {
+          uploadPaths.push(stripMatchingQuotes(inline[1] ?? ""))
+        } else {
+          const next = afterMatch.match(/^\s*("[^"]*"|'[^']*'|[^\s'"]+)/)
+          const value = next ? stripMatchingQuotes(next[1] ?? "") : ""
+          if (value && !/^https?:/i.test(value)) uploadPaths.push(value)
+        }
+        continue
+      }
+      uploadPaths.push(match[2] ?? "")
+    }
   }
   if (uploadPaths.some((p) => checkPathSensitivity(p, ctx).sensitive)) return "exfiltration.sensitive-data"
 
@@ -558,6 +724,21 @@ function classifyTarExtractOrUnzip(
       rules: ["filesystem.tar-extract-system"],
       reason: "Extracting an archive outside the working tree requires review",
     }
+  }
+  // Check -C/-d targets (or default ".") with classifyPathTarget for git-hooks/sensitive writes
+  const dirs = [...segment.matchAll(/\s-C\s+("([^"]*)"|'([^']*)'|(\S+))/gi)].map((m) => m[2] ?? m[3] ?? m[4] ?? ".")
+  const unzipDirs = [...segment.matchAll(/\s-d\s+("([^"]*)"|'([^']*)'|(\S+))/gi)].map((m) => m[2] ?? m[3] ?? m[4] ?? ".")
+  const hasExplicitTarget = isUnzip ? unzipDirs.length > 0 : dirs.length > 0
+  const targets = hasExplicitTarget ? (isUnzip ? unzipDirs : dirs) : ["."]
+  for (const dir of targets) {
+    const targetFinding = classifyPathTarget(dir, "write", ctx)
+    if (targetFinding.kind === "deny") return { verdict: "DENY", rules: [targetFinding.rule], reason: targetFinding.reason }
+    if (targetFinding.kind === "ask") return { verdict: "ASK", rules: [targetFinding.rule], reason: targetFinding.reason }
+  }
+  // Extract without explicit -C/-d: archive content can't be proven safe, so don't ALLOW
+  const isExtractMode = isUnzip || /^tar\s+x/i.test(segment) || /(?:^|\s)-\w*x/i.test(segment) || /--extract|--get/i.test(segment)
+  if (isExtractMode && !hasExplicitTarget) {
+    return { verdict: "ASK", rules: ["operation.archive-extract"], reason: "Archive extraction target is unscoped; contents cannot be verified" }
   }
   const finding = analyzeSegmentPaths(segment, ctx)
   if (finding.kind === "pass") {
@@ -656,15 +837,119 @@ function isSafeSubstitutionSurface(text: string, shell: string, ctx: PathContext
   return true
 }
 
-function isDisposableDirectoryDelete(script: string, cwd: string, worktree: string): boolean {
+const DISPOSABLE_DIR_NAMES = [
+  "node_modules", "dist", "build", "coverage", "target", ".cache", ".pytest_cache",
+  "__pycache__", ".venv", ".next", ".turbo", ".nuxt", "out", ".gradle",
+  // Generated-artifact directories commonly produced by toolchains.
+  "venv", ".tox", ".mypy_cache", ".ruff_cache", ".nyc_output", ".parcel-cache",
+  ".sass-cache", "storybook-static", "playwright-report", "test-results",
+  ".angular", ".dart_tool", "htmlcov", ".eggs",
+]
+const DISPOSABLE_NAME_SOURCE = DISPOSABLE_DIR_NAMES.join("|")
+const DISPOSABLE_TARGET_PATTERN = new RegExp(
+  `^(?:\\.?[\\\\/])?(?:${DISPOSABLE_NAME_SOURCE})[\\\\/]?$`,
+  "i",
+)
+
+type RecursiveForceDeletion = { targets: string[] }
+
+/**
+ * Parses `rm`/`Remove-Item` invocations that are provably recursive+force,
+ * whatever the flag spelling (`-rf`, `-r -f`, `--recursive --force`,
+ * `-Recurse -Force`, interleaved clusters). Unknown flags make the whole
+ * invocation unparseable so it can never reach the cleanup exemption.
+ */
+function parseRecursiveForceDeletion(segment: string): RecursiveForceDeletion | undefined {
+  const match = segment.match(/^(?:rm|remove-item|ri)\s+([^;&|]+)$/i)
+  if (!match) return undefined
+  const tokens = match[1].match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+  let sawRecursive = false
+  let sawForce = false
+  const targets: string[] = []
+  const valueFlags = new Set([
+    "-erroraction", "-warningaction", "-informationaction",
+    "-errorvariable", "-warningvariable", "-outvariable", "-outbuffer", "-pipelinevariable",
+  ])
+  for (let index = 0; index < tokens.length; index += 1) {
+    const raw = tokens[index] ?? ""
+    const flag = raw.toLowerCase()
+    if (flag === "--") continue
+    if (flag === "-path" || flag === "-literalpath") {
+      const next = tokens[index + 1]
+      if (!next) return undefined
+      targets.push(next)
+      index += 1
+      continue
+    }
+    if (raw.startsWith("-")) {
+      if (flag === "-r" || flag === "-recurse" || flag === "--recursive") sawRecursive = true
+      else if (flag === "-f" || flag === "-force" || flag === "--force") sawForce = true
+      else if (/^-[dfirvRI]+$/.test(raw)) {
+        if (/[rR]/.test(raw.slice(1))) sawRecursive = true
+        if (/f/i.test(raw.slice(1))) sawForce = true
+      } else if (flag === "-confirm:$false") {
+        // PowerShell confirmation suppressor, no value.
+      } else if (valueFlags.has(flag)) {
+        if (!tokens[index + 1]) return undefined
+        index += 1
+      } else {
+        return undefined
+      }
+      continue
+    }
+    targets.push(raw)
+  }
+  if (!sawRecursive || !sawForce || targets.length === 0) return undefined
+  return { targets }
+}
+
+/** A target qualifies when any of its own path segments is a disposable name. */
+function disposableTargetEligible(literal: string): boolean {
+  const normalizedTarget = literal.replaceAll("\\", "/").replace(/\/+$/, "")
+  if (DISPOSABLE_TARGET_PATTERN.test(normalizedTarget)) return true
+  return normalizedTarget.split("/").some((segment) => DISPOSABLE_DIR_NAMES.includes(segment.toLowerCase()))
+}
+
+async function validateDisposableLiteral(literal: string, cwd: string, worktree: string): Promise<boolean> {
+  if (literal.split(/[\\/]/).includes("..")) return false
+  if (!disposableTargetEligible(literal)) return false
+  const resolved = resolveLexical(literal, cwd, expandHome("~"))
+  if (resolved.absolute === undefined || !isWithinLexical(worktree, resolved.absolute)) return false
+  // Require the realpath of the target to be strictly within realpath(worktree),
+  // preventing symlink-prefix escapes (link→/tmp then rm -rf link/node_modules).
+  const canonical = await canonicalProjectedPath(resolved.absolute)
+  if (!canonical) return false
+  const worktreeReal = await canonicalProjectedPath(worktree)
+  if (!worktreeReal) return false
+  return isWithin(worktreeReal, canonical)
+}
+
+async function isDisposableCleanupTarget(target: string, cwd: string, worktree: string): Promise<boolean> {
+  const trimmed = target.trim()
+  const literal = literalPathToken(trimmed)
+  if (literal) return validateDisposableLiteral(literal, cwd, worktree)
+  // Brace-expanded targets fail literalPathToken ({} are rejected there);
+  // expand and require every candidate to be an eligible disposable path.
+  if (trimmed.includes("{") && trimmed.includes("}")) {
+    const candidates = braceExpansionCandidates(trimmed)
+    if (candidates.length === 0) return false
+    for (const candidate of candidates) {
+      const expanded = literalPathToken(candidate)
+      if (expanded === undefined || !(await validateDisposableLiteral(expanded, cwd, worktree))) return false
+    }
+    return true
+  }
+  return false
+}
+
+async function isDisposableDirectoryDelete(script: string, cwd: string, worktree: string): Promise<boolean> {
   const value = stripLeadingDirectoryChanges(script).replace(/\s+/g, " ").trim()
-  const rm = value.match(/^rm\s+-[a-z]*[rf][a-z]*\s+(.+)$/i)
-  if (!rm) return false
-  const targets = rm[1].trim().split(/\s+/)
-  const pattern =
-    /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)[\\/]?$/i
-  if (targets.length === 0 || !targets.every((t) => pattern.test(t))) return false
-  return targets.every((t) => isWorktreeDisposableTarget(t, cwd, worktree))
+  const deletion = parseRecursiveForceDeletion(value)
+  if (!deletion) return false
+  for (const t of deletion.targets) {
+    if (!(await isDisposableCleanupTarget(t, cwd, worktree))) return false
+  }
+  return true
 }
 
 function classifySafeChmod(segment: string, ctx: PathContext, strictness: "LOOSE" | "HARD"): SegmentDecision | undefined {
@@ -775,7 +1060,8 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     id: "execution.xargs-destructive",
     reason: "Pipes files into a destructive command via xargs",
     test: (text) =>
-      /\|\s*xargs\b[^\n]*\b(?:rm|shred|srm|wipe|unlink|rmdir|rd|del|erase|remove-item)\b/i.test(text),
+      /\|\s*xargs\b[^\n]*\b(?:rm|shred|srm|wipe|unlink|rmdir|rd|del|erase|remove-item)\b/i.test(text) ||
+      /\|\s*(?:remove-item|ri)\b/i.test(text),
   },
   {
     id: "execution.fork-bomb",
@@ -825,10 +1111,20 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     id: "git.irrecoverable-change",
     reason: "Attempts to discard local work or rewrite shared Git history",
     test: (text) =>
-      /\bgit\s+clean\b[^\n]*(?:-[a-z]*f[a-z]*d[a-z]*x|-[a-z]*x[a-z]*d[a-z]*f)\b/i.test(text) ||
+      /\bgit\s+clean\b(?=[^\n;|&]*\s-[a-z]*f)(?=[^\n;|&]*\s-[a-z]*d)(?=[^\n;|&]*\s-[a-z]*x)/i.test(text) ||
       /\bgit\s+reset\s+--hard\b/i.test(text) ||
       /\bgit\s+(?:checkout|restore)\s+--?\s*(?:\.|\*)\b/i.test(text) ||
       /\bgit\s+push\b[^\n]*(?:--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b)/i.test(text),
+  },
+  {
+    id: "git.remote-history-rewrite",
+    reason: "Attempts to rewrite or delete shared remote Git history",
+    test: hasGitRemoteHistoryRewrite,
+  },
+  {
+    id: "filesystem.root-glob-delete",
+    reason: "Forced recursive deletion of an absolute glob path outside temp areas",
+    test: hasRootGlobDelete,
   },
   {
     id: "execution.remote-pipe",
@@ -852,7 +1148,8 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       hasCrontabPersistence(text) ||
       /\bschtasks\b[^\n]*\/create\b/i.test(text) ||
       /\\CurrentVersion\\Run(?:Once)?\b/i.test(text) ||
-      /\b(?:systemctl\s+enable|launchctl\s+enable)\b/i.test(text),
+      /\b(?:systemctl\s+enable|launchctl\s+enable)\b/i.test(text) ||
+      /\b(?:at|systemd-run)\s+(?:now\b|--on-)/i.test(text),
   },
   {
     id: "network.reverse-shell",
@@ -884,6 +1181,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
 const DEFINITE_DESTRUCTIVE_RULES = new Set([
   "filesystem.forced-recursive-delete",
   "filesystem.root-delete",
+  "filesystem.root-glob-delete",
   "filesystem.disk-destruction",
   "filesystem.backup-destruction",
   "system.service-destruction",
@@ -902,6 +1200,7 @@ const DEFINITE_DESTRUCTIVE_RULES = new Set([
   "filesystem.compression-root",
   "execution.script-one-liner-destructive",
   "filesystem.brace-root-delete",
+  "git.remote-history-rewrite",
 ])
 
 /**
@@ -1634,7 +1933,7 @@ async function classifyNamedTempDeletionPolicy(
         pureDeletion = false
         break
       }
-      if (base === undefined || !(await deletionTargetsAreNamedTemp(deletion.targets, base))) {
+      if (base === undefined || !(await deletionTargetsAreNamedTemp(deletion.targets, base, input.worktree))) {
         pureDeletion = false
         break
       }
@@ -1662,9 +1961,9 @@ async function classifyNamedTempDeletionPolicy(
   return undefined
 }
 
-async function deletionTargetsAreNamedTemp(targets: string[], base: string) {
+async function deletionTargetsAreNamedTemp(targets: string[], base: string, worktree?: string) {
   for (const target of targets) {
-    if (!(await isNamedTempTargetResolved(target, base))) return false
+    if (!(await isNamedTempTargetResolved(target, base, worktree))) return false
   }
   return true
 }
@@ -2033,93 +2332,30 @@ function isTempFindRoot(root: string, cwd: string): boolean {
   return absolute === "/tmp" || absolute.startsWith("/tmp/")
 }
 
-function isExplicitDisposableCleanup(script: string, cwd: string, worktree: string): boolean {
+async function isExplicitDisposableCleanup(script: string, cwd: string, worktree: string): Promise<boolean> {
   const value = stripLeadingDirectoryChanges(script).replace(/\s+/g, " ").trim()
-  const disposableDirectory =
-    String.raw`(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?|(?=\s+(?:&&|$)))`
-  const reinstall = String.raw`(?:\s*&&\s*(?:npm|pnpm|yarn|bun)\s+(?:install|i))?`
-  const disposablePattern =
-    /^(?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)[\\/]?$/i
 
-  const rmSingle = value.match(
-    new RegExp(
-      String.raw`^rm\s+-[a-z]*[rf][a-z]*\s+((?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?))(?:\s*&&\s+(?:npm|pnpm|yarn|bun)\s+(?:install|i))?$`,
-      "i",
-    ),
-  )
-  if (rmSingle) {
-    return disposablePattern.test(rmSingle[1]) && isWorktreeDisposableTarget(rmSingle[1], cwd, worktree)
-  }
+  const findTmp = value.match(/^find\s+(\S+)\b[^;&|]*\s-mtime\s+\+\d+\b[^;&|]*\s-delete$/i)
+  if (findTmp) return isTempFindRoot(findTmp[1], cwd)
 
-  const rmForce = value.match(/^rm\s+-f\s+([^;&|]+)$/i)
-  if (rmForce) {
-    const target = rmForce[1].trim()
+  // A trailing reinstall keeps the cleanup shape (`rm -rf node_modules && npm i`).
+  const withoutInstall = value.replace(/\s*&&\s*(?:npm|pnpm|yarn|bun)\s+(?:install|i)$/i, "")
+
+  const rmForceFile = withoutInstall.match(/^rm\s+-f\s+([^;&|]+)$/i)
+  if (rmForceFile) {
+    const target = rmForceFile[1].trim()
     if (/^\/tmp\//.test(target) || /^~[\\/]Downloads[\\/][^\s]*\.tmp$/.test(target)) {
       return isTempDisposableTarget(target, cwd)
     }
     return false
   }
 
-  const findTmp = value.match(/^find\s+(\S+)\b[^;&|]*\s-mtime\s+\+\d+\b[^;&|]*\s-delete$/i)
-  if (findTmp) return isTempFindRoot(findTmp[1], cwd)
-
-  const removeItem = value.match(
-    new RegExp(
-      String.raw`^remove-item\s+(?:"|')?((?:\.?[\\/])?(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:[\\/]?))(?:"|')?\s+(?:(?:-recurse|-force)\s*){1,2}$`,
-      "i",
-    ),
-  )
-  if (removeItem) {
-    return disposablePattern.test(removeItem[1]) && isWorktreeDisposableTarget(removeItem[1], cwd, worktree)
+  const deletion = parseRecursiveForceDeletion(withoutInstall)
+  if (!deletion) return false
+  for (const t of deletion.targets) {
+    if (!(await isDisposableCleanupTarget(t, cwd, worktree))) return false
   }
-
-  const rmMultiMatch = value.match(/^rm\s+-[a-z]*[rf][a-z]*\s+(.+)$/i)
-  if (rmMultiMatch) {
-    const targets = rmMultiMatch[1].trim().split(/\s+/)
-    if (
-      targets.length > 0 &&
-      targets.every((t) => disposablePattern.test(t) && isWorktreeDisposableTarget(t, cwd, worktree))
-    ) {
-      return true
-    }
-    // PowerShell flag-interleaved forms (`rm -Force -Recurse .\node_modules`,
-    // `rm -r -f node_modules`) carry extra flags after the leading flag group;
-    // let the generic invocation branch below parse them instead of rejecting
-    // them here (they must still pass the strict recursive/flags checks there).
-    if (!targets.some((t) => t.startsWith("-"))) return false
-  }
-
-  const invocation = value.match(/^(?:remove-item|rm)\s+(.+)$/i)
-  if (!invocation) return false
-  const tokens = invocation[1].match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
-  const flags = tokens.filter((token) => token.startsWith("-")).map((token) => token.toLowerCase())
-  if (!flags.includes("-recurse")) return false
-  if (flags.some((flag) => !["-recurse", "-force", "-path", "-literalpath"].includes(flag))) return false
-
-  let target: string | undefined
-  for (let index = 0; index < tokens.length; index += 1) {
-    const token = tokens[index]
-    const flag = token.toLowerCase()
-    if (flag === "-path" || flag === "-literalpath") {
-      if (target || !tokens[index + 1]) return false
-      target = tokens[index + 1]
-      index += 1
-      continue
-    }
-    if (token.startsWith("-")) continue
-    if (target) return false
-    target = token
-  }
-  if (!target) return false
-
-  const normalizedTarget = target
-    .replace(/^(["'])([\s\S]*)\1$/, "$2")
-    .replaceAll("\\", "/")
-    .replace(/\/+$/, "")
-  if (!/(?:^|\/)(?:node_modules|dist|build|coverage|target|\.cache|\.pytest_cache|__pycache__|\.venv|\.next|\.turbo|\.nuxt|out|\.gradle)(?:\/.*)?$/i.test(normalizedTarget)) {
-    return false
-  }
-  return isWorktreeDisposableTarget(target, cwd, worktree)
+  return true
 }
 
 function shellEscapeCharacter(shell: string) {
@@ -2295,6 +2531,17 @@ function maskHeredocBody(text: string): string {
 type SegmentConnector = "&&" | "||" | ";" | "newline" | "|" | "&"
 type CommandSegment = { text: string; incoming?: SegmentConnector }
 
+/** Non-backtracking test for `(?:^|\s)\d*>\s*$` (an fd-redirect prefix such as
+ * `2>` immediately before a `>&N` merge). */
+function endsWithFdRedirectPrefix(text: string): boolean {
+  let i = text.length
+  while (i > 0 && /\s/.test(text[i - 1])) i -= 1
+  if (i === 0 || text[i - 1] !== ">") return false
+  i -= 1
+  while (i > 0 && /\d/.test(text[i - 1])) i -= 1
+  return i === 0 || /\s/.test(text[i - 1])
+}
+
 function splitCommandSegments(script: string, shell: string) {
   const value = script.trim()
   const escapeCharacter = shellEscapeCharacter(shell)
@@ -2387,7 +2634,7 @@ function splitCommandSegments(script: string, shell: string) {
       push(character === "&" ? "&&" : "||")
       continue
     }
-    if (character === "&" && /(?:^|\s)\d*>\s*$/.test(current) && /^\d$/.test(value[index + 1] ?? "")) {
+    if (character === "&" && endsWithFdRedirectPrefix(current) && /^\d$/.test(value[index + 1] ?? "")) {
       current += character
       continue
     }
@@ -2411,7 +2658,7 @@ function splitCommandSegments(script: string, shell: string) {
   return segments
 }
 
-function splitSimpleSegments(script: string, shell: string) {
+export function splitSimpleSegments(script: string, shell: string) {
   return splitCommandSegments(script, shell)?.map((segment) => segment.text)
 }
 
@@ -2438,8 +2685,7 @@ function normalizeCommandInSegment(segment: string): string {
 
 function isKnownSafeSegment(segment: string) {
   const value = normalizeCommandInSegment(
-    segment
-      .replace(/(?:\s+\d*>&\d+)+\s*$/, "")
+    stripTrailingFdMerges(segment)
       .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*/, "")
       .trim(),
   )
@@ -2489,7 +2735,7 @@ function isKnownSafeSegment(segment: string) {
   if (/^git\s+(?:status|diff|log|show|rev-parse|ls-files|grep|remote\s+-v|add|commit)\b/i.test(value)) return true
   if (/^git\s+(?:fetch|clone|checkout\s+-b|stash\s+(?:list|push)|branch\s+(?!-[dDm]\b)\S+|tag\s+(?!-[dD]\b)\S+|pull|switch|merge)\b/i.test(value)) return true
   if (
-    /^git\s+push\b(?![\s\S]*(?:\s--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s--(?:delete|mirror)\b|\s:(?:refs\/)?[\w./-]+))/i.test(
+    /^git\s+push\b(?![\s\S]*(?:\s--force(?:-with-lease)?\b|\s-[a-zA-Z]*f[a-zA-Z]*\b|\s--(?:delete|mirror)\b|\s\+[^\s:]|\s:(?:refs\/)?[\w./-]+))/i.test(
       value,
     )
   ) {
@@ -2810,7 +3056,7 @@ function hasDestructiveOpenOverwrite(text: string) {
 
 function hasDestructiveOverwrite(text: string) {
   return (
-    /\bsed\b[^\n]*-i\b[^\n]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
+    /\bsed\b[^\n]*(?:-i\b|--in-place\b)[^\n]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
     /\b(?:set-content|out-file)\b[^\n]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
     /\b(?:write_text|write_bytes)\s*\([^)]*\.(?:csv|json|db|sqlite|xlsx?|parquet)\b/i.test(text) ||
     hasDestructiveOpenOverwrite(text)
@@ -3180,7 +3426,7 @@ async function classifyHardDeletionPolicy(
   if (
     input.cwd !== undefined &&
     input.worktree !== undefined &&
-    isDisposableDirectoryDelete(segment, input.cwd, input.worktree)
+    await isDisposableDirectoryDelete(segment, input.cwd, input.worktree)
   ) {
     return {
       verdict: "ALLOW",
@@ -3190,7 +3436,15 @@ async function classifyHardDeletionPolicy(
     }
   }
 
-  if (hasForcedRecursiveDelete(combined)) {
+  // An echo/printf of a delete-looking string is documentation, not deletion.
+  // Trust that only for a bare output command with no extra decoded or wrapped
+  // surfaces and no command substitution.
+  const inertOutput =
+    surfaces.length === 1 &&
+    commandSubstitutionBodies(segment).length === 0 &&
+    /^(?:echo|printf|write-output|write-host)\b/i.test(stripHarmlessPrefixes(segment).trim())
+
+  if (hasForcedRecursiveDelete(combined) && !inertOutput) {
     return {
       verdict: "DENY",
       rules: ["hard.forced-recursive-delete"],
@@ -3546,7 +3800,7 @@ async function classifySegment(
     surfaces.length === 1 ||
     (surfaces.length === 2 && quoteSurfaceOfThisSegment !== undefined && surfaces[1] === quoteSurfaceOfThisSegment)
   const explicitDisposableCleanup =
-    isExplicitDisposableCleanup(segment, base, input.worktree) && onlyInnocentSurfaces
+    (await isExplicitDisposableCleanup(segment, base, input.worktree)) && onlyInnocentSurfaces
 
   const knownSafe = isKnownSafeSegment(stripOutputRedirects(segment) ?? segment)
   const hasExpansion = hasDynamicShellExpansion(segment, input.shell)
@@ -3570,6 +3824,15 @@ async function classifySegment(
   if (provablySafe) {
     const finding = analyzeSegmentPaths(segment, { cwd: base, worktree: input.worktree, strictness })
     if (finding.kind === "pass") {
+      // Durable-data in-place overwrite must not ride the provably-safe early
+      // allow (`sed -i` on .csv/.json/db/sqlite/xlsx/parquet).
+      if (hasDestructiveOverwrite(segment)) {
+        return {
+          verdict: "ASK",
+          rules: ["data.destructive-overwrite"],
+          reason: "Attempts in-place destructive modification of durable structured data",
+        }
+      }
       return {
         verdict: "ALLOW",
         rules: ["operation.known-safe"],
@@ -3739,6 +4002,13 @@ async function classifySegments(
     return { verdict: "ASK", rules: ["execution.wrapper"], reason: "Command wrappers exceed the review depth limit" }
   }
 
+  // Cross-segment variable tracking: in `D=rm; $D -rf x` neither segment alone
+  // carries the delete shape (the assignment and the usage split apart), so
+  // classify the substituted surface as well and keep the worse verdict.
+  const varSurface = depth === 0 ? substituteDeleteVars(script) : undefined
+  const substituted =
+    varSurface && varSurface !== script ? await classifySegments(varSurface, input, depth + 1) : undefined
+
   const rawSegments = splitCommandSegments(script, input.shell) ?? [{ text: script }]
   const results: SegmentDecision[] = []
   let base: string | undefined = input.cwd
@@ -3762,14 +4032,15 @@ async function classifySegments(
     results.push(decision)
   }
 
-  if (results.length === 0) {
-    return {
-      verdict: "ALLOW",
-      rules: [sawDirectoryChange ? "operation.directory-change" : "input.empty"],
-      reason: sawDirectoryChange ? "The command only changes the working directory" : "The executable script is empty",
-    }
-  }
-  return combineSegmentDecisions(results)
+  const direct =
+    results.length === 0
+      ? {
+          verdict: "ALLOW" as SecurityVerdict,
+          rules: [sawDirectoryChange ? "operation.directory-change" : "input.empty"],
+          reason: sawDirectoryChange ? "The command only changes the working directory" : "The executable script is empty",
+        }
+      : combineSegmentDecisions(results)
+  return substituted ? combineSegmentDecisions([direct, substituted]) : direct
 }
 
 const DOWNLOAD_OR_BUILD_PATTERN = new RegExp(
@@ -3867,7 +4138,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     }
   }
   // Literal piped into a shell interpreter: `printf 'rm -rf /' | sh`.
-  const literalShell = /(?:echo|printf)\s+["'][^"']{1,200}?(?:\brm\b[^\n;|"'&]*-[rf]|\bshred\b|\brm\s+-rf\b)[^"']*["']\s*\|\s*(?:sh|bash|zsh|dash)\b/i.test(
+  const literalShell = /(?:echo|printf)\s+["'][^"']{0,200}?(?:\brm\b[^\n;|"'&]*-[rf]|\bshred\b|\brm\s+-rf\b)[^"']*["']\s*\|\s*(?:sh|bash|zsh|dash)\b/i.test(
     source,
   )
   if (literalShell) {
@@ -3904,6 +4175,26 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
       })
       cloudScriptChars += inspected.content.length
     } else {
+      // Single file exceeds cloud budget: send head+tail window with truncation marker
+      const content = inspected.content
+      const headSize = 64000
+      const tailSize = 64000
+      if (content.length > headSize + tailSize) {
+        const head = content.slice(0, headSize)
+        const tail = content.slice(content.length - tailSize)
+        const middleOmitted = content.length - headSize - tailSize
+        localScripts.push({
+          path: inspected.reviewPath,
+          content: head + `\n[TRUNCATED: middle ${middleOmitted} bytes omitted of ${content.length} total]\n` + tail,
+          sha256: inspected.fingerprint.sha256,
+        })
+      } else {
+        localScripts.push({
+          path: inspected.reviewPath,
+          content: content,
+          sha256: inspected.fingerprint.sha256,
+        })
+      }
       uninspectedLocalScripts.push(candidate)
     }
   }
@@ -3942,7 +4233,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   }
 
   if (
-    isExplicitDisposableCleanup(source, input.cwd, input.worktree) &&
+    await isExplicitDisposableCleanup(source, input.cwd, input.worktree) &&
     executableSurfaces.length === 1 &&
     localScriptSurfaces.length === 0 &&
     (input.strictness ?? "LOOSE") !== "HARD"
@@ -3964,6 +4255,22 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   if (localScriptCombined) {
     for (const rule of SECURITY_SIGNAL_RULES) {
       if (rule.test(localScriptCombined)) extraSignals.set(rule.id, rule.reason)
+    }
+    // Exfiltration primitives inside an inspected script must surface as review
+    // signals too; without this, `bash script.sh` with a curl -T/scp upload is
+    // ALLOWed on the strength of the script's otherwise-clean content.
+    const scriptExfil = hasExfilOrDangerousPerms(localScriptCombined, localScriptCombined, {
+      cwd: input.cwd,
+      worktree: input.worktree,
+      strictness: input.strictness ?? "LOOSE",
+    })
+    if (scriptExfil) {
+      extraSignals.set(
+        scriptExfil,
+        scriptExfil === "permissions.sensitive-mode"
+          ? "The local script sets dangerous permissions on a credential or system file and requires review"
+          : "The local script sends credential or system data off-host and requires review",
+      )
     }
     if (hasCriticalDataDestruction(localScriptCombined)) {
       extraSignals.set("data.critical-delete", "Local script may delete credential or key material and requires review")

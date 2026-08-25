@@ -36,6 +36,14 @@ export type ReviewCommand = (
   options: ReviewCommandOptions,
 ) => Promise<CloudReviewResult>
 
+export type SlowCommandsOptions = {
+  enabled?: boolean
+  maxDepth?: number
+  sleepThresholdSeconds?: number
+  allowExplicitTimeout?: boolean
+  [key: string]: unknown
+}
+
 export type BashClassifierOptions = {
   shell?: string
   securityEnabled?: boolean
@@ -46,6 +54,14 @@ export type BashClassifierOptions = {
   strictness?: Strictness
   failPolicy?: FailPolicy
   dynamicReview?: DynamicReviewOptions
+  /** Block (static DENY) safe-but-wasteful commands: unbounded scans of
+   * system/mounted trees, streaming commands, and over-long sleeps.
+   * When `true` (default) enables the slow-command classifier. When an object,
+   * `enabled` toggles it independently. */
+  slowCommands?: boolean | SlowCommandsOptions
+  /** Append one JSONL line to ~/.opencode/reviewer-trace.jsonl for every
+   * dynamic review (verdict or error) and every dynamic cache hit. */
+  logReviewerTrace?: boolean
   /** Test-injection only; never wired by the plugin itself. */
   reviewCommand?: ReviewCommand
   [key: string]: unknown
@@ -65,6 +81,13 @@ export type ResolvedDynamicReview = {
   reason?: string
 }
 
+export type ResolvedSlowCommands = {
+  enabled: boolean
+  maxDepth: number
+  sleepThresholdSeconds: number
+  allowExplicitTimeout: boolean
+}
+
 export type ResolvedPluginConfig = {
   shell?: string
   securityEnabled: boolean
@@ -74,6 +97,8 @@ export type ResolvedPluginConfig = {
   supervisorPath: string
   strictness: Strictness
   failPolicy: FailPolicy
+  slowCommands: ResolvedSlowCommands
+  logReviewerTrace: boolean
   dynamicReview: ResolvedDynamicReview
   reviewCommand?: ReviewCommand
 }
@@ -88,8 +113,12 @@ const ALLOWED_TOP_LEVEL = new Set([
   "strictness",
   "failPolicy",
   "dynamicReview",
+  "slowCommands",
+  "logReviewerTrace",
   "reviewCommand",
 ])
+
+const ALLOWED_SLOW_FIELDS = new Set(["enabled", "maxDepth", "sleepThresholdSeconds", "allowExplicitTimeout"])
 
 const ALLOWED_DYNAMIC_FIELDS = new Set([
   "baseURL",
@@ -409,6 +438,41 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     detachedStartIsolation = source.detachedStartIsolation
   }
 
+  let slowCommands: ResolvedSlowCommands
+  if (source.slowCommands === undefined) {
+    slowCommands = { enabled: true, maxDepth: 3, sleepThresholdSeconds: 120, allowExplicitTimeout: true }
+  } else if (typeof source.slowCommands === "boolean") {
+    slowCommands = {
+      enabled: source.slowCommands,
+      maxDepth: 3,
+      sleepThresholdSeconds: 120,
+      allowExplicitTimeout: true,
+    }
+  } else if (isPlainObject(source.slowCommands)) {
+    const raw = source.slowCommands as Record<string, unknown>
+    for (const key of Object.keys(raw)) {
+      if (!ALLOWED_SLOW_FIELDS.has(key)) throw new Error(`unknown slowCommands option: ${key}`)
+    }
+    const enabled = raw.enabled === undefined ? true : raw.enabled
+    const maxDepth = raw.maxDepth === undefined ? 3 : raw.maxDepth
+    const sleepThresholdSeconds = raw.sleepThresholdSeconds === undefined ? 120 : raw.sleepThresholdSeconds
+    const allowExplicitTimeout = raw.allowExplicitTimeout === undefined ? true : raw.allowExplicitTimeout
+    if (typeof enabled !== "boolean") throw new Error("slowCommands.enabled must be a boolean")
+    if (typeof maxDepth !== "number" || !Number.isInteger(maxDepth) || maxDepth < 0 || maxDepth > 32)
+      throw new Error("slowCommands.maxDepth must be an integer between 0 and 32")
+    if (
+      typeof sleepThresholdSeconds !== "number" ||
+      !Number.isFinite(sleepThresholdSeconds) ||
+      sleepThresholdSeconds < 0
+    )
+      throw new Error("slowCommands.sleepThresholdSeconds must be a non-negative number")
+    if (typeof allowExplicitTimeout !== "boolean")
+      throw new Error("slowCommands.allowExplicitTimeout must be a boolean")
+    slowCommands = { enabled, maxDepth, sleepThresholdSeconds, allowExplicitTimeout }
+  } else {
+    throw new Error("slowCommands must be a boolean or an object")
+  }
+
   if (source.supervisorEnabled !== undefined && typeof source.supervisorEnabled !== "boolean") {
     throw new Error("supervisorEnabled must be a boolean")
   }
@@ -452,6 +516,14 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     configuredReviewCommand = source.reviewCommand as ReviewCommand
   }
 
+  let logReviewerTrace = false
+  if (source.logReviewerTrace !== undefined) {
+    if (typeof source.logReviewerTrace !== "boolean") {
+      throw new Error("logReviewerTrace must be a boolean")
+    }
+    logReviewerTrace = source.logReviewerTrace
+  }
+
   const dynamicReview = resolveDynamicReview(source.dynamicReview, strictness)
   const routeReview = configuredReviewCommand ?? (dynamicReview.available ? reviewCommandWithAuditor : undefined)
   const reviewCommand: ReviewCommand | undefined = routeReview
@@ -471,6 +543,8 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     supervisorPath,
     strictness,
     failPolicy,
+    slowCommands,
+    logReviewerTrace,
     dynamicReview,
     reviewCommand,
   }

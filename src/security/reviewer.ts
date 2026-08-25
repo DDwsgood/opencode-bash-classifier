@@ -68,9 +68,48 @@ type PythonCandidate = {
   prefixArgs: string[]
 }
 
+/**
+ * Error thrown when a dynamic review fails. Carries a coarse classification so
+ * callers can distinguish security/protocol violations (fail-close) from
+ * infrastructure failures (honor fail policy). `exitCode` is the auditor
+ * process exit code (when available); `reads`/`transcript` are recovered from
+ * the auditor's structured side-channel on non-zero exit. `code` mirrors the
+ * errno for spawn failures so candidate fallback can still detect ENOENT.
+ */
+export class ReviewError extends Error {
+  kind: "protocol" | "infra"
+  exitCode?: number
+  reads?: Array<{ path: string; size: number }>
+  transcript?: Array<{ role: string; content: string }>
+  code?: string
+  constructor(
+    message: string,
+    kind: "protocol" | "infra",
+    extras?: {
+      exitCode?: number
+      reads?: Array<{ path: string; size: number }>
+      transcript?: Array<{ role: string; content: string }>
+      code?: string
+    },
+  ) {
+    super(message)
+    this.name = "ReviewError"
+    this.kind = kind
+    if (extras) {
+      if (extras.exitCode !== undefined) this.exitCode = extras.exitCode
+      if (extras.reads) this.reads = extras.reads
+      if (extras.transcript) this.transcript = extras.transcript
+      if (extras.code !== undefined) this.code = extras.code
+    }
+  }
+}
+
 const MAX_STDOUT_CHARS = 64_000
 const MAX_STDERR_CHARS = 8_000
-const MAX_REVIEW_INPUT_BYTES = 1_000_000
+// 256KB preflight budget (≈6.4万 token, 15x余量). Exceeding it is a defensive
+// failure signal (possible injection/DoS attempting to overwhelm the reviewer)
+// and is thrown as a protocol ReviewError so callers fail-close.
+const MAX_REVIEW_INPUT_BYTES = 262_144
 const DEFAULT_TIMEOUT_MS = 30_000
 const ISOLATED_FLAGS = ["-I", "-B"]
 
@@ -306,6 +345,82 @@ function parseReviewResult(stdout: string, policy: "LOOSE" | "HARD"): CloudRevie
   return result
 }
 
+// Auditor non-zero exit codes that are infrastructure failures (honor fail
+// policy): 4 = HTTP error, 5 = network error. Every other non-zero exit —
+// including 2 (input validation), 6 (mandatory-inspection violation), 7
+// (generic review exception), unrecognized codes, and signal deaths — defaults
+// to "protocol" so a defensive failure closes the gate rather than letting an
+// ambiguous failure fall through to fail_open.
+const INFRA_EXIT_CODES = new Set([4, 5])
+
+function classifyExitCode(code: number | null): "protocol" | "infra" {
+  if (code !== null && INFRA_EXIT_CODES.has(code)) return "infra"
+  return "protocol"
+}
+
+type AuditorSideChannel = {
+  message?: string
+  reads?: Array<{ path: string; size: number }>
+  transcript?: Array<{ role: string; content: string }>
+}
+
+// On non-zero exit the auditor may write one line of structured JSON to stdout
+// ({"error":{"exit","message"},"reads":[{path,size}],"transcript":[{role,content}],
+// "truncated":bool}). Parse defensively: any missing/malformed field is treated
+// as absent so a half-written side channel never corrupts the error path.
+function parseAuditorSideChannel(stdout: string): AuditorSideChannel | null {
+  const trimmed = stdout.trim()
+  if (!trimmed) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    // The contract is a single JSON line; if the whole stdout is not JSON, try
+    // the last non-empty line (auditor diagnostics may precede it).
+    const lines = trimmed.split(/\r?\n/).filter((line) => line.trim())
+    const last = lines[lines.length - 1]
+    if (!last) return null
+    try {
+      parsed = JSON.parse(last)
+    } catch {
+      return null
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null
+  const obj = parsed as Record<string, unknown>
+  const result: AuditorSideChannel = {}
+  const error = obj.error
+  if (error && typeof error === "object" && !Array.isArray(error)) {
+    const e = error as Record<string, unknown>
+    if (typeof e.message === "string") result.message = e.message
+  }
+  if (Array.isArray(obj.reads)) {
+    const reads: Array<{ path: string; size: number }> = []
+    for (const entry of obj.reads) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const r = entry as Record<string, unknown>
+        if (typeof r.path === "string" && typeof r.size === "number" && Number.isFinite(r.size)) {
+          reads.push({ path: r.path, size: r.size })
+        }
+      }
+    }
+    if (reads.length) result.reads = reads
+  }
+  if (Array.isArray(obj.transcript)) {
+    const transcript: Array<{ role: string; content: string }> = []
+    for (const entry of obj.transcript) {
+      if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+        const t = entry as Record<string, unknown>
+        if (typeof t.role === "string" && typeof t.content === "string") {
+          transcript.push({ role: t.role, content: t.content })
+        }
+      }
+    }
+    if (transcript.length) result.transcript = transcript
+  }
+  return result
+}
+
 async function runCandidate(
   candidate: PythonCandidate,
   auditorPath: string,
@@ -344,7 +459,7 @@ async function runCandidate(
     }
     const abort = () => {
       child.kill()
-      finish(() => reject(new Error("The auditor was aborted")))
+      finish(() => reject(new ReviewError("The auditor was aborted", "infra")))
     }
     const timer = setTimeout(() => {
       timedOut = true
@@ -361,32 +476,49 @@ async function runCandidate(
       stdout += chunk.toString()
       if (stdout.length > MAX_STDOUT_CHARS) {
         child.kill()
-        finish(() => reject(new Error("The auditor returned too much output")))
+        finish(() => reject(new ReviewError("The auditor returned too much output", "protocol")))
       }
     })
     child.stderr?.on("data", (chunk: Buffer | string) => {
       stderr = (stderr + chunk.toString()).slice(-MAX_STDERR_CHARS)
     })
     child.stdin?.once("error", (error: NodeJS.ErrnoException) => {
-      if (error.code !== "EPIPE") finish(() => reject(error))
+      if (error.code !== "EPIPE") {
+        finish(() => reject(new ReviewError(error.message, "infra", { code: error.code })))
+      }
     })
     child.stdin?.end(reviewInput)
-    child.once("error", (error) => finish(() => reject(error)))
-    child.once("close", (code) => {
+    child.once("error", (error: NodeJS.ErrnoException) =>
+      finish(() => reject(new ReviewError(error.message, "infra", { code: error.code }))),
+    )
+    child.once("close", (code: number | null) => {
       finish(() => {
         if (timedOut) {
-          reject(new Error(`The auditor timed out after ${timeoutMs}ms`))
+          reject(new ReviewError(`The auditor timed out after ${timeoutMs}ms`, "infra"))
           return
         }
         if (code !== 0) {
-          const detail = stderr.trim().replace(/\s+/g, " ").slice(0, 500)
-          reject(new Error(detail || `The auditor exited with code ${code}`))
+          const side = parseAuditorSideChannel(stdout)
+          const kind = classifyExitCode(code)
+          const fallback =
+            code === null
+              ? "The auditor was killed by a signal"
+              : `The auditor exited with code ${code}`
+          const detail = side?.message || stderr.trim().replace(/\s+/g, " ").slice(0, 500) || fallback
+          reject(
+            new ReviewError(detail, kind, {
+              exitCode: code === null ? undefined : code,
+              reads: side?.reads,
+              transcript: side?.transcript,
+            }),
+          )
           return
         }
         try {
           resolve(parseReviewResult(stdout, options.policy))
         } catch (error) {
-          reject(error)
+          const message = error instanceof Error ? error.message : String(error)
+          reject(new ReviewError(message, "protocol"))
         }
       })
     })
@@ -458,7 +590,7 @@ export async function reviewCommandWithAuditor(
   const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS
   const reviewInput = JSON.stringify(requestForPolicy(normalizeReviewRequest(request), routedOptions.policy))
   if (Buffer.byteLength(reviewInput, "utf8") > MAX_REVIEW_INPUT_BYTES) {
-    throw new Error("The review input exceeded the safety limit")
+    throw new ReviewError("The review input exceeded the safety limit", "protocol")
   }
 
   const failures: Error[] = []
@@ -473,7 +605,7 @@ export async function reviewCommandWithAuditor(
     }
   }
 
-  throw failures.at(-1) ?? new Error("No Python 3 interpreter was found for the auditor")
+  throw failures.at(-1) ?? new ReviewError("No Python 3 interpreter was found for the auditor", "infra")
 }
 
 /**

@@ -291,6 +291,14 @@ const REASON_BROAD_SCAN = "Scanning a filesystem root requires review"
 const REASON_FOREIGN_HOME = "Accessing another user's home directory requires review"
 const REASON_UNPARSEABLE = "The path contains dynamic expansion and cannot be proven safe"
 
+/**
+ * Worktree-relative path fragments whose contents are executed by trusted
+ * tools, so writing into them plants code that later fires inside a
+ * known-safe command (a planted .git/hooks/pre-commit runs on the
+ * whitelisted `git commit`).
+ */
+const WORKTREE_EXEC_TRIGGERS = ["/.git/hooks/"]
+
 export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete", ctx: PathContext): PathFinding {
   const home = getHome()
   const resolved = resolveLexical(raw, ctx.cwd, home)
@@ -337,6 +345,14 @@ export function classifyPathTarget(raw: string, mode: "read" | "write" | "delete
   }
   if (mode === "read" && resolved.foreignHome) {
     return { kind: "ask", rule: "credentials.foreign-home", reason: REASON_FOREIGN_HOME }
+  }
+  if (mode !== "read" && resolved.absolute !== undefined) {
+    const norm = resolved.absolute.replaceAll("\\", "/").toLowerCase()
+    if (WORKTREE_EXEC_TRIGGERS.some((trigger) => norm.includes(trigger) || norm.endsWith(trigger.replace(/\/$/, "")))) {
+      return ctx.strictness === "HARD"
+        ? { kind: "deny", rule: "persistence.git-hooks", reason: "Writing git hooks is forbidden" }
+        : { kind: "ask", rule: "persistence.git-hooks", reason: "Writing git hooks plants code that fires on trusted git commands and requires review" }
+    }
   }
   if (mode === "read" && isBroadScanRoot(resolved.absolute)) {
     return { kind: "ask", rule: "filesystem.broad-scan", reason: REASON_BROAD_SCAN }
@@ -548,10 +564,32 @@ function tokenize(value: string): string[] {
   return value.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
 }
 
+/** Non-backtracking replacement for the ReDoS-prone regex /(?:\s+\d*>&\d+)+\s*$/. */
+export function stripTrailingFdMerges(text: string): string {
+  let wsEnd = text.length
+  while (wsEnd > 0 && /[\s]/.test(text[wsEnd - 1])) wsEnd -= 1
+  let matchEnd = wsEnd
+  let found = false
+  for (;;) {
+    let j = matchEnd
+    while (j > 0 && /\d/.test(text[j - 1])) j -= 1
+    if (j === matchEnd) break
+    if (j < 2 || text[j - 1] !== "&" || text[j - 2] !== ">") break
+    let k = j - 2
+    while (k > 0 && /\d/.test(text[k - 1])) k -= 1
+    if (k === j - 2) break
+    let wsStart = k
+    while (wsStart > 0 && /[\s]/.test(text[wsStart - 1])) wsStart -= 1
+    if (wsStart === k) break
+    matchEnd = wsStart
+    found = true
+  }
+  return found ? text.slice(0, matchEnd) : text
+}
+
 /** Command leaf of a segment, ignoring env prefixes and the PowerShell `&` call form. */
 export function segmentCommandLeaf(segment: string): string {
-  let value = segment
-    .replace(/(?:\s+\d*>&\d+)+\s*$/, "")
+  let value = stripTrailingFdMerges(segment)
     .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*/, "")
     .trim()
   const callMatch = value.match(/^&\s+(?:"([^"]+)"|'([^']+)'|(\S+))/)
@@ -891,7 +929,7 @@ export function extractWriteTargets(segment: string): { targets: string[]; unpar
   if (tokens.length < 2) return { targets, unparseable }
 
   if (command === "tee") {
-    const { positionals } = positionalArgs(tokens, { valueFlags: ["-a", "--append", "-p", "--pid"] })
+    const { positionals } = positionalArgs(tokens, { valueFlags: ["-p", "--pid"] })
     targets.push(...positionals)
   } else if (command === "dd") {
     for (let i = 1; i < tokens.length; i += 1) {
