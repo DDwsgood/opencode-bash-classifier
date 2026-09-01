@@ -85,11 +85,19 @@
 
 ### 不可绕过底线
 
-以下规则任何类别都不豁免：`filesystem.root-delete`（含 `/etc`、`/usr`、`/lib`、`/boot`、`/srv` 等系统根）、`brace-root-delete`、`root-glob-delete`、`find-delete-root`（同上系统根）、`disk-destruction`、`execution.fork-bomb`（含 `:(){ :|:& };:` 全形状，跨段判定）、`kernel-trigger`、`kernel-core-pattern`（含 `tee`/`cp`/`mv` 管道与拷贝写入形式）、`network.reverse-shell`、`execution.literal-shell`。这些规则在**完整脚本**上判定，不受 `|`/`&`/`;` 段拆分影响。动态审查器的 BYPASS RULE 提示词同样声明这些保持 DENY。
+以下规则任何类别都不豁免，且在**完整脚本**上判定（不受 `|`/`&`/`;` 段拆分影响）：
+
+- `filesystem.root-delete`（含 `/etc`、`/usr`、`/lib`、`/lib64`、`/sys`、`/proc`、`/mnt` 等 15 个系统根的**裸根或直接 glob**；根下的普通子路径如 `/var/tmp/...`、`/home/user/proj` 属 scoped 删除，可被 filesystem 豁免）、`brace-root-delete`、`root-glob-delete`、`find-delete-root`（`rm` 与 `find` 共用同一系统根列表）；
+- `disk-destruction`；
+- `execution.fork-bomb`（引号内容视为惰性文本；要求函数名作为管道一侧的命令词形成递归核心，`:(){ :|:& };:`、单侧递归 `f(){ f | g; }; f`、`while :; do $0& done` 均命中；`build(){ npm run build | tee log; }; build` 这类正常函数不误报）；
+- `kernel-trigger`、`kernel-core-pattern`（覆盖重定向/`dd of=`/命令位的 `tee`/`cp`/`mv`/`rsync`/`install` 写入（目的地可为带引号、后接注释或重定向）及 `sysctl -w kernel.core_pattern=`；`echo tee /proc/...` 这类惰性文本不误报；读方向的 `cp /proc/sysrq-trigger /tmp/x` 不命中）；
+- `network.reverse-shell`、`execution.literal-shell`。
+
+动态审查器的 BYPASS RULE 提示词同样声明这些保持 DENY。
 
 ### 静态放行语义
 
-arm 后命令不会被静态层直接 ALLOW：豁免对应检查后以 `bypass.static-allow` ASK 交动态审查器（配合对应 BYPASS RULE 提示词裁决），保持 fail-close。无 bypass 的会话行为与旧版完全一致。
+arm 后命令不会被静态层直接 ALLOW：豁免对应检查后以 `bypass.static-allow` ASK 交动态审查器（配合对应 BYPASS RULE 提示词裁决），保持 fail-close。无 bypass 的会话行为与旧版一致——仅有的例外是三类**修复目标**：fork bomb 全形状、`tee`/`cp`/`sysctl` 形式的 kernel 写入、`/lib64` 系统根——旧版这些只被兜底 ASK 挡住，现在被对应 floor 规则正确 DENY。
 
 ## 行为总览
 

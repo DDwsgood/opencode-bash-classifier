@@ -63,16 +63,26 @@ reviewer prompt hardening. All findings from the post-implementation review roun
 - Heredoc findings, `execution.local-script`, and `execution.local-script-signal`
   respect armed categories.
 - **Floor hardening (segment-split evasion)**: fork bombs
-  (`:(){ :|:& };:`), kernel-trigger writes (`echo x | tee
-  /proc/sysrq-trigger`), and core_pattern writes (`… | tee
-  /proc/sys/kernel/core_pattern`, `cp … /proc/sys/kernel/core_pattern`) are now
-  judged on the full script, because the `&`/`|` inside these shapes previously
-  split them into per-segment pieces the rules never saw — the fork-bomb rule
-  did not fire on the canonical shape even without any bypass. The fork-bomb
-  predicate now requires the function name on both sides of a pipe (recursion
-  core), and the kernel predicates cover `tee`/`cp`/`mv`/`rsync`/`install`
-  writes with the target as destination.
-- `find` root-deletion floor now also covers `/lib`, `/lib64`, `/srv`.
+  (`:(){ :|:& };:`, one-sided pipe recursion `f(){ f | g; }; f`, `while :; do
+  $0& done`), kernel-trigger writes (`echo x | tee /proc/sysrq-trigger`,
+  `cp x /proc/sysrq-trigger`, sysctl-style `kernel.core_pattern=`), and
+  core_pattern writes are now judged on the full script, because the `&`/`|`
+  inside these shapes previously split them into per-segment pieces the rules
+  never saw — the fork-bomb rule did not fire on the canonical shape even
+  without any bypass. The fork-bomb predicate now treats quoted spans as inert
+  data, requires the function name as the command word of a pipe side
+  (recursion core; `build(){ npm run build | tee log; }; build` stays allowed),
+  and fixes the `while :`/`while [ … ]` boundary that made those alternatives
+  dead. The kernel predicates are command-position anchored (so `echo tee
+  /proc/…` inert text does not match) and accept quoted destinations with
+  trailing comments/redirections.
+- The system-root deletion floor (`rm -rf /etc`) now matches only the bare root
+  or a direct glob over it (`/etc/*`, `/etc*`) — never deeper paths
+  (`/var/tmp/...`, `/home/user/project/...`), which the filesystem bypass
+  covers. One shared `SYSTEM_CRITICAL_ROOTS` list now drives both `rm -rf` and
+  `find … -delete` floors (etc/usr/bin/sbin/boot/var/home/root/opt/lib/lib64/
+  srv/sys/proc/mnt), so they cannot disagree; `/lib64` and `find /lib64
+  -delete` are covered.
 - Environment line reports the OS name (e.g. "Ubuntu 24.04 LTS WSL") instead of a
   kernel release, with WSL distro-name dedup.
 - `userBypass` is sorted to match the dynamic cache key (one key ⇒ one prompt

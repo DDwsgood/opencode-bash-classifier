@@ -682,7 +682,9 @@ const plugin: Plugin = {
           const wslDistro = process.env.WSL_DISTRO_NAME
           const isWsl = process.env.WSL_INTEROP !== undefined || wslDistro !== undefined
           const base = pretty ?? "Linux"
+          const endsWithWsl = /\bwsl$/i.test(base)
           if (!isWsl) system = base
+          else if (endsWithWsl) system = base
           else if (pretty && wslDistro && base.toLowerCase().includes(wslDistro.toLowerCase()))
             system = `${base} WSL`
           else if (wslDistro) system = `${base} ${wslDistro} WSL`

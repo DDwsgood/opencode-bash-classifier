@@ -326,29 +326,21 @@ function hasDeletePrimitive(text: string): boolean {
 
 // --- M2 (P1) helper predicates ---------------------------------------------
 
+/** System-critical roots for the deletion floors (root-delete and
+ * find-delete-root). One shared list so `rm -rf X` and `find X -delete` can
+ * never disagree; `run`/`media` are intentionally excluded (runtime/mount
+ * points, not system integrity). */
+const SYSTEM_CRITICAL_ROOTS = ["etc", "usr", "bin", "sbin", "boot", "var", "home", "root", "opt", "lib", "lib64", "srv", "sys", "proc", "mnt"]
+
 function isDangerousFindRoot(root: string): boolean {
   const r = root.replaceAll("\\", "/")
   if (r === "~" || r.startsWith("~/")) return true
   if (r === ".." || r.startsWith("../")) return true
   const lower = r.toLowerCase()
   if (lower === "/") return true
-  return [
-    "/etc",
-    "/var",
-    "/boot",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/home",
-    "/root",
-    "/opt",
-    "/srv",
-    "/sys",
-    "/proc",
-    "/mnt",
-  ].some((p) => lower === p || lower.startsWith(p + "/"))
+  return SYSTEM_CRITICAL_ROOTS.some(
+    (p) => lower === `/${p}` || lower.startsWith(`/${p}/`),
+  )
 }
 
 function findDangerousDeleteRoot(text: string): boolean {
@@ -357,8 +349,40 @@ function findDangerousDeleteRoot(text: string): boolean {
   return isDangerousFindRoot(match[1] ?? "")
 }
 
+/** Kernel-floor write detection for a /proc target path: `> file` / `of=file`
+ * redirects, and command-position `tee`/`cp`/`mv`/`rsync`/`install` with the
+ * target as the trailing destination. Command-position anchoring (the command
+ * word starts the trailing command of a line/pipe side) keeps `echo tee ...`
+ * inert-text mentions from matching; the trailing-destination requirement
+ * keeps reads (`cp /proc/sysrq-trigger /tmp/x`) from matching. */
+function kernelWriteTest(text: string, target: string): boolean {
+  const escapedTarget = target.replace(/\//g, "\\/")
+  if (new RegExp(`(?:>\\s*|\\bof=)[^\\n]*${escapedTarget}\\b`, "i").test(text)) return true
+  // `tee` as a command word (its file argument is always a write).
+  const teeCommand = new RegExp(`(?:^|[\\n;|&])\\s*(?:sudo\\s+)?tee\\b[^\\n]*${escapedTarget}\\b`, "i")
+  if (teeCommand.test(text)) return true
+  // `#` comments and `\d*>` redirections are valid after a destination.
+  const dest = new RegExp(`\\s["']?${escapedTarget}["']?\\s*(?:[#>|&;\\n]|\\d*>|$)`, "i")
+  const writers = /\b(?:cp|mv|rsync|install)\b/gi
+  let match: RegExpExecArray | null
+  while ((match = writers.exec(text)) !== null) {
+    // Only a trailing command of the line counts: `echo x && cp ...` is a
+    // write; `echo cp ...` is inert text.
+    const before = text.slice(Math.max(0, match.index - 200), match.index)
+    if (!/(?:^|[\n;|&])\s*(?:sudo\s+|env\s+\S+\s+)?$/.test(before)) continue
+    const after = text.slice(match.index, match.index + 300)
+    if (dest.test(after)) return true
+  }
+  return false
+}
+
 function hasForkBomb(text: string): boolean {
-  const stripped = text.replace(/["']/g, "")
+  // Neutralize quoted spans instead of deleting the quotes: text inside
+  // quotes is data (`echo "x | x"`), never real pipe/background operators.
+  const stripped = text
+    .replace(/"(?:[^"\\]|\\.)*"/g, " ")
+    .replace(/'(?:[^'\\])*'/g, " ")
+    .replace(/`(?:[^`\\]|\\.)*`/g, " ")
   // Linear scan for name(){ ...|...name...&... }...name fork-bomb patterns.
   const nameChars = /[\w:.*-]/
   let pos = 0
@@ -386,18 +410,45 @@ function hasForkBomb(text: string): boolean {
     }
     if (depth !== 0 || closeIdx >= stripped.length) continue
     const body = stripped.slice(braceIdx + 1, closeIdx)
-    // Recursion core: the function's own name on BOTH sides of a pipe inside
-    // the body (`:(){ :|:& };:`, `bomb(){ bomb|bomb& };bomb`). A name that
-    // merely appears elsewhere in the body (`npm run build | tee log`) is not
-    // recursion.
-    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-    const pipeRecursion = new RegExp(`${escaped}\\s*\\|\\s*${escaped}(?![\\w:.*-])`)
-    if (!body.includes("|") || !pipeRecursion.test(body)) continue
+    if (!body.includes("|")) continue
+    // Recursion core: the function's own name is the command word of either
+    // side of a pipe in the body (`:(){ :|:& };:`, one-sided `f(){ f | g; };
+    // f`). The command word is the first token of the side's trailing
+    // command, so the name as a mere argument (`npm run build | tee log`) is
+    // not recursion.
+    const nameWord = new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w:.*-])`)
+    // The command word of a pipe side is the first token of its last
+    // non-empty `;`/`&`-separated command (`f;` ends AT the `;`, so the
+    // command is `f` itself, not whatever follows).
+    const sideRecurses = (side: string) => {
+      const lastCommand = side
+        .split(/[;&]/)
+        .map((piece) => piece.trim())
+        .filter(Boolean)
+        .pop()
+      return lastCommand !== undefined && nameWord.test(lastCommand)
+    }
+    const sides = body.split("|")
+    let recurses = false
+    for (let index = 0; index < sides.length - 1; index += 1) {
+      if (sideRecurses(sides[index]!) || sideRecurses(sides[index + 1]!)) {
+        recurses = true
+        break
+      }
+    }
+    if (!recurses) continue
     if (body.includes("&")) return true
     const after = stripped.slice(closeIdx + 1).replace(/^[\s;&]*/, "")
-    if (new RegExp(`^${escaped}(?![\\w:.*-])`).test(after)) return true
+    if (nameWord.test(after)) return true
   }
-  if (/\bwhile\s+(?:true|1|:|\[[^\]]*\])\b[^;]*;\s*do\s+[^;]*\$0\s*&/.test(stripped)) return true
+  // `:` and `]` are non-word chars: a single trailing `\b` never matches after
+  // them, so each while-condition alternative needs its own boundary.
+  if (
+    /\bwhile\s+(?:(?:true|1)(?![\w:.*-])|:(?=\s*;)|\[[^\]]*\](?=\s*;))[^;]*;\s*do\s+[^;]*\$0\s*&/.test(
+      stripped,
+    )
+  )
+    return true
   // pipe self-reference: name | name & (linear scan, no backreference)
   let pipePos = 0
   for (;;) {
@@ -1014,13 +1065,18 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
     reason: "Attempts broad recursive deletion at a filesystem, home, or system-critical root",
     test: (text) =>
       // `rm -rf /`, `/etc`, `/usr`, `/boot`, ... — system-critical roots are
-      // floor: never bypassable by the filesystem category.
-      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?(?:\/|~\/?|\.\.?\/?|\*|\/(?:etc|usr|bin|sbin|boot|var|home|root|opt|lib|srv)(?:\/|\*|$))(?:\s|$|[;&|])/im.test(
+      // floor: never bypassable by the filesystem category. The system-root
+      // alternative matches the bare root or a DIRECT glob over it
+      // (`/etc/*`, `/etc*`), never a deeper path (`/var/tmp/...`,
+      // `/home/user/project/...`) — those are scoped deletions the filesystem
+      // bypass covers. Keep this list in sync with isDangerousFindRoot.
+      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?(?:\/|~\/?|\.\.?\/?|\*)(?:\s|$|[;&|])/im.test(
         text,
       ) ||
-      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?\/(?:etc|usr|bin|sbin|boot|var|home|root|opt|lib|srv)(?:[/*\s]|$)/im.test(
-        text,
-      ) ||
+      new RegExp(
+        `\\brm\\s+(?:-[a-z]*[rf][a-z]*\\s+)+(?:--no-preserve-root\\s+)?\\/(?:${SYSTEM_CRITICAL_ROOTS.join("|")})(?:\\*|\\/\\*|\\/)?(?=[\\s;&|]|$)`,
+        "im",
+      ).test(text) ||
       /\b(?:rmdir|rd)\s+\/s\s+\/q\s+(?:[a-z]:\\|\\|\/|\.\.?|\*)(?:\s|$)/im.test(text) ||
       /\bdel\s+\/[a-z]*s[a-z]*\s+\/[a-z]*q[a-z]*\s+(?:[a-z]:\\|\\|\/|\*)(?:\s|$)/im.test(text) ||
       /\bremove-item\b[^\n]*(?:-recurse[^\n]*-force|-force[^\n]*-recurse)[^\n]*(?:[a-z]:\\(?:\*|$)|\/(?:\*|$)|~(?:\/|\s|$)|\.\.?(?:\/|\s|$)|\*)(?:\s|$)/im.test(
@@ -1110,26 +1166,23 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   {
     id: "filesystem.kernel-trigger",
     reason: "Attempts to write the kernel sysrq trigger or crash mechanisms",
-    // Redirect / dd-of writes (baseline form) plus pipe/copy writers; `tee`
-    // always writes to its file argument, copy commands only when the trigger
-    // is the destination (trailing path, not a source). Pipe forms span `|`
-    // segment splits.
-    test: (text) =>
-      /(?:>\s*|\bof=)[^\n]*\/proc\/sysrq-trigger\b/i.test(text) ||
-      /\btee\b[^\n]*\/proc\/sysrq-trigger\b/i.test(text) ||
-      /\b(?:cp|mv|rsync|install)\b[^\n|;&]*\s\/proc\/sysrq-trigger\s*(?:[|;&\n]|$)/i.test(text),
+    // Command-position anchored: redirect/dd-of writes (baseline form) plus
+    // `tee`/`cp`/`mv`/`rsync`/`install` as the command word, with the trigger
+    // as the trailing destination (optionally quoted, followed by end, a
+    // separator, a comment, or a redirection). Command-word anchoring keeps
+    // `echo tee /proc/...` from matching; the trailing-destination form keeps
+    // `cp /proc/sysrq-trigger /tmp/x` (source read) from matching. Pipe forms
+    // span `|` segment splits, so the full-script floor check runs these too.
+    test: (text) => kernelWriteTest(text, "/proc/sysrq-trigger"),
   },
   {
     id: "filesystem.kernel-core-pattern",
     reason: "Attempts to set a piped core_pattern (kernel code execution)",
     // Any write to core_pattern is the floor: redirect/dd-of, tee, or copy
-    // commands with it as the trailing destination. Piping INTO a program
-    // (`| /usr/bin/crash`) is the code-exec form and is covered by the same
-    // write markers.
-    test: (text) =>
-      /(?:>\s*|\bof=)[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text) ||
-      /\btee\b[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text) ||
-      /\b(?:cp|mv|rsync|install)\b[^\n|;&]*\s\/proc\/sys\/kernel\/core_pattern\s*(?:[|;&\n]|$)/i.test(text),
+    // commands with it as the trailing destination, plus the sysctl spelling
+    // (`sysctl -w kernel.core_pattern=...`), which is a kernel-execution
+    // primitive the floor must not lose.
+    test: (text) => kernelWriteTest(text, "/proc/sys/kernel/core_pattern") || /\bsysctl\s+(?:-[a-z]*w[a-z]*\s+)?kernel\.core_pattern\s*=/i.test(text),
   },
   {
     id: "permissions.root-recursive",
@@ -4258,12 +4311,16 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
   // runs before the per-segment SECURITY_SIGNAL_RULES loop, so the per-segment
   // check alone never sees the full shape; these are floor rules (never
   // bypassable) and DEFINITE-destructive, so DENY on the full script up front.
+  // `source` only (not decoded payloads): a decoded payload that is merely
+  // printed (`echo <b64> | base64 -d`) never executes; genuinely executed
+  // wrappers/remote-pipes are handled by the wrapper, remote-pipe, and
+  // literal-shell checks below and by classifySegments recursion.
   const forkBombRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.fork-bomb")
   const kernelTriggerRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.kernel-trigger")
   const kernelCorePatternRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.kernel-core-pattern")
   for (const rule of [forkBombRule, kernelTriggerRule, kernelCorePatternRule]) {
     if (!rule || ruleBypassed(rule.id, bypassed)) continue
-    if (rule.test(executableSurfaces.join("\n\n"))) {
+    if (rule.test(source)) {
       return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
     }
   }
