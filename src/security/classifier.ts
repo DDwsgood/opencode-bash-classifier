@@ -332,6 +332,35 @@ function hasDeletePrimitive(text: string): boolean {
  * points, not system integrity). */
 const SYSTEM_CRITICAL_ROOTS = ["etc", "usr", "bin", "sbin", "boot", "var", "home", "root", "opt", "lib", "lib64", "srv", "sys", "proc", "mnt"]
 
+/** Lexically normalize `..`/`.` segments so `rm -rf /var/../etc` resolves to
+ * `/etc` for the root-delete floor. */
+function normalizeDots(operand: string): string {
+  const out: string[] = []
+  for (const segment of operand.replaceAll("\\", "/").split("/")) {
+    if (segment === "..") out.pop()
+    else if (segment !== "." && segment !== "") out.push(segment)
+  }
+  return `/${out.join("/")}`
+}
+
+/** Every path operand of every `rm` invocation, dot-normalized, each rebuilt
+ * as its own pseudo-invocation so the per-operand regex shape applies: the
+ * root-delete floor must see all operands (`rm -rf /var/tmp/foo /etc`) and
+ * traversal forms (`rm -rf /var/../etc` → `/etc`), not only the first one. */
+function normalizedRootDeleteText(text: string): string {
+  const invocations = text.match(/\brm\b(?:(?!"|'|`)[^\r\n;&|]|"(?:[^"]|"")*"|'[^']*'|`.)*/gi) ?? []
+  const allOperands = invocations.flatMap((invocation) => {
+    const tokens = invocation.match(/"(?:[^"]|"")*"|'[^']*'|\S+/g) ?? []
+    return tokens
+      .slice(1)
+      .filter((token) => !token.startsWith("-"))
+      .map(stripMatchingQuotes)
+      .filter(Boolean)
+      .map(normalizeDots)
+  })
+  return allOperands.map((operand) => `rm -rf ${operand}`).join("\n")
+}
+
 function isDangerousFindRoot(root: string): boolean {
   const r = root.replaceAll("\\", "/")
   if (r === "~" || r.startsWith("~/")) return true
@@ -358,18 +387,27 @@ function findDangerousDeleteRoot(text: string): boolean {
 function kernelWriteTest(text: string, target: string): boolean {
   const escapedTarget = target.replace(/\//g, "\\/")
   if (new RegExp(`(?:>\\s*|\\bof=)[^\\n]*${escapedTarget}\\b`, "i").test(text)) return true
-  // `tee` as a command word (its file argument is always a write).
-  const teeCommand = new RegExp(`(?:^|[\\n;|&])\\s*(?:sudo\\s+)?tee\\b[^\\n]*${escapedTarget}\\b`, "i")
+  // `tee` as a command word (its file argument is always a write). Prefixes
+  // that still make it the command word: sudo (+flags/`-u user`), command,
+  // builtin, busybox, `env VAR=…`, and leading shell assignments.
+  const commandPrefix = "(?:sudo(?:\\s+-{1,2}[\\w-]+|\\s+\\S+)*\\s+|command\\s+|builtin\\s+|busybox\\s+|env\\s+(?:\\w+=\\S+\\s+)*|\\w+=\\S+\\s+|\\\\\\s*)*"
+  const teeCommand = new RegExp(
+    `(?:^|[\\n;|&])\\s*(?:${commandPrefix})tee\\b[^\\n]*${escapedTarget}\\b`,
+    "i",
+  )
   if (teeCommand.test(text)) return true
-  // `#` comments and `\d*>` redirections are valid after a destination.
-  const dest = new RegExp(`\\s["']?${escapedTarget}["']?\\s*(?:[#>|&;\\n]|\\d*>|$)`, "i")
+  // `#` comments and `\d*>` redirections are valid after a destination, but
+  // only with separating whitespace: `trigger2>` and `trigger#x` are literal
+  // filenames (shell-verified), not a redirection or comment.
+  const dest = new RegExp(`\\s["']?${escapedTarget}["']?(?:\\s(?:[#>|&;\\n]|\\d*>)|$)`, "i")
   const writers = /\b(?:cp|mv|rsync|install)\b/gi
+  const writerPrefix = /(?:^|[\n;|&])\s*(?:sudo(?:\s+-{1,2}[\w-]+|\s+\S+)*\s+|command\s+|builtin\s+|busybox\s+|env\s+(?:\w+=\S+\s+)*|(?:\w+=\S+\s+)*|(?:\\\s*)?)$/
   let match: RegExpExecArray | null
   while ((match = writers.exec(text)) !== null) {
     // Only a trailing command of the line counts: `echo x && cp ...` is a
     // write; `echo cp ...` is inert text.
     const before = text.slice(Math.max(0, match.index - 200), match.index)
-    if (!/(?:^|[\n;|&])\s*(?:sudo\s+|env\s+\S+\s+)?$/.test(before)) continue
+    if (!writerPrefix.test(before)) continue
     const after = text.slice(match.index, match.index + 300)
     if (dest.test(after)) return true
   }
@@ -379,9 +417,11 @@ function kernelWriteTest(text: string, target: string): boolean {
 function hasForkBomb(text: string): boolean {
   // Neutralize quoted spans instead of deleting the quotes: text inside
   // quotes is data (`echo "x | x"`), never real pipe/background operators.
+  // Single quotes have no escapes (backslash is ordinary), double quotes and
+  // backticks honor backslash escapes.
   const stripped = text
     .replace(/"(?:[^"\\]|\\.)*"/g, " ")
-    .replace(/'(?:[^'\\])*'/g, " ")
+    .replace(/'(?:[^'])*'/g, " ")
     .replace(/`(?:[^`\\]|\\.)*`/g, " ")
   // Linear scan for name(){ ...|...name...&... }...name fork-bomb patterns.
   const nameChars = /[\w:.*-]/
@@ -419,16 +459,19 @@ function hasForkBomb(text: string): boolean {
     const nameWord = new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w:.*-])`)
     // The command word of a pipe side is the first token of its last
     // non-empty `;`/`&`-separated command (`f;` ends AT the `;`, so the
-    // command is `f` itself, not whatever follows).
+    // command is `f` itself, not whatever follows). `||` is a list operator,
+    // not a pipe, and `2>&1`/`&>` are redirections — mask both before
+    // splitting so they cannot fake separators or pipe sides.
     const sideRecurses = (side: string) => {
-      const lastCommand = side
+      const masked = side.replace(/\|\|/g, " ").replace(/\d*>&\d/g, " ").replace(/&>/g, " ")
+      const lastCommand = masked
         .split(/[;&]/)
         .map((piece) => piece.trim())
         .filter(Boolean)
         .pop()
       return lastCommand !== undefined && nameWord.test(lastCommand)
     }
-    const sides = body.split("|")
+    const sides = body.replace(/\|\|/g, " ").split("|")
     let recurses = false
     for (let index = 0; index < sides.length - 1; index += 1) {
       if (sideRecurses(sides[index]!) || sideRecurses(sides[index + 1]!)) {
@@ -1076,7 +1119,7 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
       new RegExp(
         `\\brm\\s+(?:-[a-z]*[rf][a-z]*\\s+)+(?:--no-preserve-root\\s+)?\\/(?:${SYSTEM_CRITICAL_ROOTS.join("|")})(?:\\*|\\/\\*|\\/)?(?=[\\s;&|]|$)`,
         "im",
-      ).test(text) ||
+      ).test(normalizedRootDeleteText(text)) ||
       /\b(?:rmdir|rd)\s+\/s\s+\/q\s+(?:[a-z]:\\|\\|\/|\.\.?|\*)(?:\s|$)/im.test(text) ||
       /\bdel\s+\/[a-z]*s[a-z]*\s+\/[a-z]*q[a-z]*\s+(?:[a-z]:\\|\\|\/|\*)(?:\s|$)/im.test(text) ||
       /\bremove-item\b[^\n]*(?:-recurse[^\n]*-force|-force[^\n]*-recurse)[^\n]*(?:[a-z]:\\(?:\*|$)|\/(?:\*|$)|~(?:\/|\s|$)|\.\.?(?:\/|\s|$)|\*)(?:\s|$)/im.test(
