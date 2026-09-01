@@ -40,15 +40,16 @@
 // (message preserved) — acceptable, since the block message is what matters.
 
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
 import { access, appendFile, mkdir, readFile, realpath } from "node:fs/promises"
-import { homedir } from "node:os"
+import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { Effect, Stream } from "effect"
 import type { Plugin } from "@opencode-ai/plugin/effect/plugin"
 import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
-import { resolvePluginConfig, type BashClassifierOptions } from "./config"
+import { BYPASS_CATEGORIES, resolvePluginConfig, type BashClassifierOptions, type BypassCategory } from "./config"
 import {
   classifyShellCommand,
   isDownloadOrBuildCommand,
@@ -77,7 +78,7 @@ const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 
 const DYNAMIC_ALLOW_CACHE_TTL_MS = 15 * 60 * 1000
 const DYNAMIC_DENY_CACHE_TTL_MS = 90 * 1000
 const MAX_DYNAMIC_ALLOW_CACHE_ENTRIES = 512
-const PROMPT_VERSION = "v2"
+const PROMPT_VERSION = "v3"
 const SESSION_STATE_TTL_MS = 30 * 60 * 1000
 const MAX_SESSION_STATES = 512
 const MAX_OUTPUT_TAIL_CHARS = 2000
@@ -303,9 +304,9 @@ export function normalizeCacheKeyScript(script: string): string {
  * Cache keys are GLOBAL (no session component): the payload already carries
  * every security-relevant context (script, cwd, shell, static rules, script
  * fingerprints, target-directory listings, referenced paths, strictness,
- * endpoint, model, prompt version), and cached entries are only written for
- * non-forced LOOSE reviews, so a verdict from another session for the exact
- * same context is sound to reuse. A shorter TTL bounds staleness.
+ * endpoint, model, prompt version, bypass categories), and cached entries are
+ * only written for non-forced LOOSE reviews, so a verdict from another session
+ * for the exact same context is sound to reuse. A shorter TTL bounds staleness.
  */
 export function dynamicAllowCacheKey(
   script: string,
@@ -315,6 +316,7 @@ export function dynamicAllowCacheKey(
   endpoint: string,
   model: string,
   strictness: string,
+  bypassedCategories?: string[],
 ) {
   const context = decision.reviewContext
   if (
@@ -341,6 +343,7 @@ export function dynamicAllowCacheKey(
     referencedPaths: context?.referencedPaths ?? [],
     referencedPathsTruncated: context?.referencedPathsTruncated ?? false,
     strictness,
+    bypassCategories: bypassedCategories ?? [],
     endpoint,
     model,
     promptVersion: PROMPT_VERSION,
@@ -430,6 +433,9 @@ interface EffectPluginContext {
       callback: (event: ShellCreateBeforeEvent) => Effect.Effect<void, never>,
     ) => Effect.Effect<unknown, never, Scope.Scope>
   }
+  readonly command: {
+    readonly transform: (callback: (draft: CommandDraft) => void) => Effect.Effect<unknown, never, Scope.Scope>
+  }
   readonly session: {
     readonly get: (input: { sessionID: string }) => Effect.Effect<unknown, unknown>
     readonly interrupt: (input: { sessionID: string; continue?: boolean }) => Effect.Effect<unknown, unknown>
@@ -443,48 +449,63 @@ interface EffectPluginContext {
   readonly event: { readonly subscribe: () => Stream.Stream<unknown> }
 }
 
+// v2 ctx.command.transform draft (packages/plugin/src/effect/command.ts).
+type CommandDraft = {
+  add(definition: {
+    name: string
+    description?: string
+    execute: (input: { sessionID: string; prompt: { text: string } }) => Effect.Effect<void, unknown>
+  }): void
+}
+
 // Async preamble (config discovery + fail_ask normalization + supervisor probe)
 // extracted so the effect body can bridge it with one `Effect.promise`. A setup
 // failure dies the plugin load (acceptable: a misconfigured plugin should not
 // silently run with defaults).
+//
+// config.json (package root) is a BASE layer: when it exists it is always read
+// and every field it defines is overridden by the corresponding explicit
+// `options` field, so live installs that pass options can still own permanent
+// settings (like BypassClassifier) in config.json.
 async function resolveStartup(rawOptions: unknown) {
   const options = (rawOptions ?? {}) as Record<string, unknown>
-  let source = options
+  // Base layer: package-root config.json is ALWAYS read when present, so
+  // permanent settings (BypassClassifier, reviewer credentials) live there even
+  // when the host passes explicit options or a configFile directive.
+  let source: Record<string, unknown> = {}
+  try {
+    source = JSON.parse(await readFile(path.join(PACKAGE_ROOT, "config.json"), "utf8")) as Record<string, unknown>
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code
+    if (code !== "ENOENT") {
+      // A malformed config must be loud: silently ignoring it would leave the
+      // user believing safety settings (reviewer, fail-close) are active.
+      console.warn(
+        `[opencode-bash-classifier] fallback config.json could not be read (${code ?? "invalid JSON"}); defaults apply`,
+      )
+      source = {}
+    }
+    // ENOENT: no fallback config file; defaults apply silently.
+  }
+  // Overlay 1: explicit configFile (highest-priority file source).
   if (typeof options.configFile === "string") {
     const configPath = path.isAbsolute(options.configFile)
       ? options.configFile
       : path.resolve(process.cwd(), options.configFile)
-    source = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>
-  } else if (Object.keys(options).length === 0) {
-    const fallbackPath = path.join(PACKAGE_ROOT, "config.json")
-    let fallbackRaw: string | undefined
-    try {
-      fallbackRaw = await readFile(fallbackPath, "utf8")
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException | undefined)?.code
-      if (code !== "ENOENT") {
-        console.warn(
-          `[opencode-bash-classifier] fallback config.json could not be read (${code ?? "unknown error"}); defaults apply`,
-        )
-      }
-      // No fallback config file; defaults apply.
-    }
-    if (fallbackRaw !== undefined) {
-      try {
-        source = JSON.parse(fallbackRaw) as Record<string, unknown>
-      } catch (error) {
-        // A malformed config must be loud: silently ignoring it would leave the
-        // user believing safety settings (reviewer, fail-close) are active.
-        console.warn(
-          `[opencode-bash-classifier] fallback config.json is not valid JSON and was ignored: ${(error as Error).message}`,
-        )
-      }
-    }
+    const overlay = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>
+    source = { ...source, ...overlay }
+  }
+  // Overlay 2: explicit options win field by field.
+  for (const [key, value] of Object.entries(options)) {
+    if (key !== "configFile") source[key] = value
   }
   // `configFile` is a loader directive, not a plugin option — strip it before
   // resolvePluginConfig (whose whitelist rejects unknown fields).
   const { configFile: _ignored, ...pluginOptions } = source
   const resolved = resolvePluginConfig(pluginOptions as BashClassifierOptions | undefined)
+  for (const warning of resolved.bypassWarnings) {
+    console.warn(`[opencode-bash-classifier] ${warning}`)
+  }
   // v2's Tool.Context has no `ask`, so human-in-the-loop approval cannot be
   // implemented. `fail_ask` is normalized to `fail_close`: an unavailable or
   // failed reviewer becomes a denial, never a question.
@@ -535,6 +556,151 @@ const plugin: Plugin = {
     const sessionDirectories = new Map<string, { directory: string; worktree: string; at: number }>()
     let consecutiveDynamicFailures = 0
     let lastDynamicFailureToastAt = 0
+
+    // --- temporary bypass state (activity-renewed lease) --------------------
+    // In-memory by design: a service restart clears every lease, and a lease
+    // expires when the session stays quiet for bypassLeaseTtlMs (TUI closed
+    // → no user activity → no renewal). Subagent children inherit the armed
+    // categories so a bypass armed on the root session covers its spawned
+    // subagents doing the actual shell work.
+    type BypassLease = { categories: Set<BypassCategory>; expiresAt: number }
+    const bypassLeases = new Map<string, BypassLease>()
+    // child → parent links (session lifetime, NOT lease lifetime): written on
+    // session.created, cleared on session.deleted only.
+    const bypassParent = new Map<string, string>()
+
+    /** Ancestors of a session (nearest first), bounded by cycle guard. */
+    function bypassAncestors(sessionID: string): string[] {
+      const chain: string[] = []
+      const seen = new Set<string>([sessionID])
+      let cursor = resolved.bypassPropagateToSubagents ? bypassParent.get(sessionID) : undefined
+      while (cursor && !seen.has(cursor)) {
+        seen.add(cursor)
+        chain.push(cursor)
+        cursor = bypassParent.get(cursor)
+      }
+      return chain
+    }
+
+    /** Renew the session's own lease and every live ancestor lease: child
+     * activity (a subagent doing the shell work) keeps the parent bypass the
+     * child inherits from expiring mid-work. */
+    function renewBypassLease(sessionID: string) {
+      const now = Date.now()
+      pruneExpiredBypassLeases(now)
+      for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
+        const lease = bypassLeases.get(target)
+        if (lease) lease.expiresAt = now + resolved.bypassLeaseTtlMs
+      }
+    }
+
+    function pruneExpiredBypassLeases(now: number) {
+      // Expiry only drops the lease, never the parent link: a child whose own
+      // lease expired must still fall through to a still-active ancestor.
+      for (const [sessionID, lease] of bypassLeases) {
+        if (lease.expiresAt <= now) bypassLeases.delete(sessionID)
+      }
+    }
+
+    /** Active bypass categories for a session: permanent config set ∪ the
+     * union of every live lease along the ancestor chain (the session's own
+     * lease plus inherited parent leases). */
+    function activeBypass(sessionID: string): Set<BypassCategory> {
+      const now = Date.now()
+      pruneExpiredBypassLeases(now)
+      const active = new Set<BypassCategory>(resolved.bypassClassifier)
+      for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
+        const lease = bypassLeases.get(target)
+        if (lease) for (const category of lease.categories) active.add(category)
+      }
+      return active
+    }
+
+    function describeCategories(categories: Iterable<string>) {
+      const list = [...categories]
+      if (list.length === 0) return "none"
+      return list.sort().join(", ")
+    }
+
+    function parseBypassArguments(text: string): { add: Set<BypassCategory>; clear: boolean; invalid: string[] } {
+      const tokens = text
+        .split(/[\s,]+/)
+        .map((token) => token.trim().toLowerCase())
+        .filter(Boolean)
+      const add = new Set<BypassCategory>()
+      const invalid: string[] = []
+      let clear = false
+      for (const token of tokens) {
+        if (token === "off" || token === "clear" || token === "none") {
+          clear = true
+          continue
+        }
+        if (token === "all") {
+          for (const category of BYPASS_CATEGORIES) add.add(category)
+          continue
+        }
+        if ((BYPASS_CATEGORIES as readonly string[]).includes(token)) {
+          add.add(token as BypassCategory)
+          continue
+        }
+        invalid.push(token)
+      }
+      return { add, clear, invalid }
+    }
+
+    function armBypassLease(sessionID: string, categories: Set<BypassCategory>) {
+      bypassLeases.set(sessionID, {
+        categories: new Set(categories),
+        expiresAt: Date.now() + resolved.bypassLeaseTtlMs,
+      })
+      // Freshly armed session: prior rejection records would keep forcing
+      // dynamic review (and HARD abort semantics) for a bypassed command.
+      const state = sessions.get(sessionID)
+      if (state) {
+        state.lastRejected = undefined
+        state.touchedAt = Date.now()
+        state.version += 1
+      }
+    }
+
+    // Detect OS/shell context for the auditor's environment line (an
+    // OS-level description like "Ubuntu 24.04 WSL", not a kernel release).
+    let environmentLine: { system?: string; bash?: string } | undefined
+    function detectEnvironment() {
+      if (environmentLine) return environmentLine
+      const platform = process.platform
+      let system: string | undefined
+      try {
+        if (platform === "linux") {
+          let pretty: string | undefined
+          try {
+            const osReleaseContent = readFileSync("/etc/os-release", "utf8")
+            pretty = osReleaseContent.match(/^PRETTY_NAME="?([^"\n]+)"?/m)?.[1]
+          } catch {
+            pretty = undefined
+          }
+          const wslDistro = process.env.WSL_DISTRO_NAME
+          const isWsl = process.env.WSL_INTEROP !== undefined || wslDistro !== undefined
+          const base = pretty ?? "Linux"
+          if (!isWsl) system = base
+          else if (pretty && wslDistro && base.toLowerCase().includes(wslDistro.toLowerCase()))
+            system = `${base} WSL`
+          else if (wslDistro) system = `${base} ${wslDistro} WSL`
+          else system = `${base} WSL`
+        } else if (platform === "win32") {
+          system = `Windows ${osRelease()}`
+        } else if (platform === "darwin") {
+          system = `macOS ${osRelease()}`
+        } else {
+          system = `${platform} ${osRelease()}`.trim()
+        }
+      } catch {
+        system = undefined
+      }
+      const bash = configuredShell ?? process.env.SHELL ?? (platform === "win32" ? "powershell" : "/bin/bash")
+      environmentLine = { system, bash }
+      return environmentLine
+    }
 
     // Reviewer audit trail (logReviewerTrace): one JSONL line per dynamic
     // review verdict/error and per cache hit, appended to
@@ -810,6 +976,12 @@ const plugin: Plugin = {
         rejectStatic(sessionState, "", "Empty command")
       }
 
+      const bypassed = activeBypass(sessionID)
+      const bypassedCategories = bypassed.size > 0 ? bypassed : undefined
+      // Executing a command in this session is activity: renew its lease so an
+      // actively worked session keeps its bypass while the TUI stays open.
+      renewBypassLease(sessionID)
+
       const requestedWorkdir = workdirFromArgs(input)
       const { directory, worktree } = await sessionDirectory(sessionID)
       const cwd = await canonicalOrResolved(
@@ -826,7 +998,16 @@ const plugin: Plugin = {
         worktree,
         shell,
         strictness: resolved.strictness,
+        bypassedCategories,
       })
+      if (bypassedCategories && resolved.logReviewerTrace) {
+        writeReviewerTrace({
+          kind: "bypass_active",
+          sessionID,
+          command: script,
+          categories: [...bypassedCategories].sort(),
+        })
+      }
 
       // Static DENY is absolute — cannot be overridden by approval or dynamic review.
       if (staticDecision.verdict === "DENY") {
@@ -866,6 +1047,7 @@ const plugin: Plugin = {
           resolved.dynamicReview.endpoint ?? "",
           resolved.dynamicReview.model ?? "",
           resolved.strictness,
+          bypassedCategories ? [...bypassedCategories].sort() : undefined,
         )
         if (cacheKey && hasCachedDynamicAllow(dynamicAllowCache, cacheKey, Date.now())) {
           maybeBlockSlow(script, input, shell, cwd, worktree)
@@ -911,10 +1093,26 @@ const plugin: Plugin = {
       if (failureAtStart) {
         reviewRequest.previousFailedCommand = failureAtStart.value
       }
+      if (bypassedCategories && bypassedCategories.size > 0) {
+        // Sorted to match the dynamic cache key, so one key always means one
+        // BYPASS_RULE prompt ordering.
+        const promptCategories = [...bypassedCategories]
+          .filter((category) => category !== "dynamic")
+          .sort()
+        if (promptCategories.length > 0) reviewRequest.userBypass = promptCategories
+      }
+      // Environment awareness is part of every dynamic review, not only
+      // bypassed ones.
+      reviewRequest.environment = detectEnvironment()
 
       let cloudReview: CloudReviewResult | undefined
       let reviewError: Error | undefined
-      if (reviewerAvailable()) {
+      // `dynamic` bypass: treat the reviewer as unavailable for this session so
+      // the existing failPolicy routing decides the outcome (fail_open allows,
+      // fail_close denies). A skipped reviewer must never count as a reviewer
+      // "failure" for the consecutive-failure toast.
+      const dynamicBypassed = bypassedCategories?.has("dynamic") === true
+      if (!dynamicBypassed && reviewerAvailable()) {
         try {
           // Concurrent identical reviews share one in-flight call instead of
           // racing duplicate auditor processes at the endpoint.
@@ -947,7 +1145,11 @@ const plugin: Plugin = {
           })
         }
       } else {
-        reviewError = new Error(resolved.dynamicReview.reason ?? "Dynamic review is not configured")
+        reviewError = new Error(
+          dynamicBypassed
+            ? "Dynamic review is disabled for this session by a user-armed bypass"
+            : (resolved.dynamicReview.reason ?? "Dynamic review is not configured"),
+        )
       }
 
       if (cloudReview) {
@@ -1006,7 +1208,7 @@ const plugin: Plugin = {
       }
 
       // Consecutive dynamic review failure tracking for TUI notification (3 times)
-      if (!cloudReview && reviewerAvailable() && reviewError) {
+      if (!cloudReview && !dynamicBypassed && reviewerAvailable() && reviewError) {
         await maybeNotifyDynamicConsecutiveFailures(sessionID, reviewError)
       }
 
@@ -1170,26 +1372,132 @@ const plugin: Plugin = {
       ),
     )
 
-    // --- 7. session cleanup (v1 event hook) ---------------------------------
+    // --- 7. session cleanup + bypass lease maintenance (v1 event hook) -------
     // ctx.event.subscribe() returns a Stream of wire events; the durable
     // `session.deleted` payload is { type, data: { sessionID } } (verified in
     // packages/schema/src/session-event.ts). The consumer is forked onto the
     // plugin scope: unloading the plugin interrupts the fiber, replacing the old
     // manual `eventRunning`/iterator cleanup.
+    //
+    // The same consumer maintains the temporary-bypass lease:
+    //  - `session.created` records parent→child links so subagents inherit an
+    //    armed bypass (bypassPropagateToSubagents, default true);
+    //  - activity events (viewed / inbox delivered / execution started) renew
+    //    the lease of the session they name, approximating "TUI still open":
+    //    with the TUI closed no user-visible activity flows and the lease
+    //    expires after bypassLeaseTtlMs.
+    const BYPASS_RENEWAL_EVENTS = new Set([
+      "session.viewed",
+      "session.inbox.delivered",
+      "session.execution.started",
+      "session.step.started",
+      "session.shell.started",
+    ])
     yield* ctx.event
       .subscribe()
       .pipe(
         Stream.runForEach((event: unknown) =>
           Effect.sync(() => {
-            const e = event as { type?: string; data?: { sessionID?: string } }
+            const e = event as {
+              type?: string
+              data?: { sessionID?: string; parentID?: string }
+            }
+            const sessionID = e?.data?.sessionID
             if (e?.type === "session.deleted") {
-              const sessionID = e.data?.sessionID
-              if (typeof sessionID === "string") deleteSessionState(sessionID)
+              if (typeof sessionID === "string") {
+                deleteSessionState(sessionID)
+                bypassLeases.delete(sessionID)
+                bypassParent.delete(sessionID)
+                // Children still linking to the deleted parent would otherwise
+                // dangle forever; the map stays bounded to live sessions.
+                for (const [child, parent] of bypassParent) {
+                  if (parent === sessionID) bypassParent.delete(child)
+                }
+              }
+              return
+            }
+            if (e?.type === "session.created") {
+              const parentID = e.data?.parentID
+              if (
+                resolved.bypassPropagateToSubagents &&
+                typeof sessionID === "string" &&
+                typeof parentID === "string" &&
+                parentID
+              ) {
+                bypassParent.set(sessionID, parentID)
+              }
+              return
+            }
+            if (typeof sessionID === "string" && BYPASS_RENEWAL_EVENTS.has(e?.type ?? "")) {
+              renewBypassLease(sessionID)
             }
           }),
         ),
       )
       .pipe(Effect.forkScoped)
+
+    // --- 8. /bypass-classifier server command --------------------------------
+    // Server-registered slash command: the TUI autocomplete lists it and
+    // submission routes through client.api.session.command, so the arguments
+    // never reach the model. State changes live only in this plugin process
+    // (see bypassLeases). Status/errors are reported with session.synthetic
+    // (resume:false) so the chat transcript carries the outcome.
+    yield* ctx.command.transform((draft) => {
+      draft.add({
+        name: "bypass-classifier",
+        description:
+          "Arm temporary classifier bypass categories for this session (filesystem|os|secret|dynamic|web, 'all', or 'off')",
+        execute: (input) =>
+          Effect.tryPromise({
+            try: async () => {
+              const sessionID = input.sessionID
+              const permanent: ReadonlySet<string> = resolved.bypassClassifier
+              const args = parseBypassArguments(input.prompt?.text ?? "")
+              if (args.invalid.length > 0) {
+                await run(
+                  ctx.session.synthetic({
+                    sessionID,
+                    text: `Unknown bypass categor${args.invalid.length > 1 ? "ies" : "y"}: ${args.invalid.join(", ")}. Valid: filesystem, os, secret, dynamic, web, all, off.`,
+                    metadata: { source: "bash-classifier-bypass" },
+                    resume: false,
+                  }),
+                ).catch(() => {})
+                return
+              }
+              if (args.clear) {
+                bypassLeases.delete(sessionID)
+              }
+              if (args.add.size > 0) {
+                // Additive: start from the session's current active set (own
+                // lease plus inherited parents) so a second invocation keeps
+                // previously armed categories. `off` starts from scratch.
+                const next = args.clear ? new Set<BypassCategory>() : activeBypass(sessionID)
+                for (const category of args.add) next.add(category)
+                armBypassLease(sessionID, next)
+              }
+              const active = activeBypass(sessionID)
+              const temporary = [...active].filter((category) => !permanent.has(category))
+              const lease = bypassLeases.get(sessionID)
+              const lines = [
+                `BypassClassifier status for this session:`,
+                `  Active: ${describeCategories(active) || "none"}`,
+                `  Permanent (config.json): ${describeCategories(permanent) || "none"}`,
+                `  Temporary (this session, ${resolved.bypassPropagateToSubagents ? "inherited by subagents" : "not inherited"}): ${describeCategories(temporary) || "none"}${lease ? `, expires in ${Math.max(1, Math.round((lease.expiresAt - Date.now()) / 60000))} min of inactivity` : ""}`,
+                `Usage: /bypass-classifier <filesystem|os|secret|dynamic|web|all|off> — categories: space or comma separated.`,
+              ]
+              await run(
+                ctx.session.synthetic({
+                  sessionID,
+                  text: lines.join("\n"),
+                  metadata: { source: "bash-classifier-bypass" },
+                  resume: false,
+                }),
+              ).catch(() => {})
+            },
+            catch: () => Effect.void,
+          }),
+      })
+    })
 
     // Clear in-memory caches when the plugin scope finalizes (unload). The
     // forked event fiber is interrupted by the same scope close.
@@ -1200,6 +1508,8 @@ const plugin: Plugin = {
         dynamicDenyCache.clear()
         inflightReviews.clear()
         sessionDirectories.clear()
+        bypassLeases.clear()
+        bypassParent.clear()
       }),
     )
   }),
@@ -1211,6 +1521,7 @@ export { reviewCommandWithAuditor, reviewCommandWithAuditor as reviewCommandWith
 export { resolvePluginConfig } from "./config"
 export type {
   BashClassifierOptions,
+  BypassCategory,
   FailPolicy,
   ResolvedDynamicReview,
   ResolvedPluginConfig,

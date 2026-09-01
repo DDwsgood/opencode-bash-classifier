@@ -2,6 +2,8 @@ import { createHash } from "node:crypto"
 import type { Dirent } from "node:fs"
 import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
+import type { BypassCategory } from "../config"
+import { ruleBypassed } from "./bypass"
 import {
   analyzeSegmentPaths,
   checkPathSensitivity,
@@ -81,6 +83,10 @@ export type ClassifyShellCommandInput = {
   nowMs?: number
   trustedTempRoot?: string
   strictness?: Strictness
+  /** Bypass categories armed for this session; matching rule groups are
+   * skipped except for the unconditional floor (root destruction, disk
+   * destruction, fork bombs, kernel primitives, reverse shells). */
+  bypassedCategories?: ReadonlySet<BypassCategory>
 }
 
 type InternalClassifyInput = ClassifyShellCommandInput & {
@@ -307,6 +313,12 @@ function hasHostShutdownCommand(text: string): boolean {
   return false
 }
 
+/** Network clients matched as command words only: a bare `\bssh\b` would also
+ * hit paths like `~/.ssh/id_rsa` and wrongly defeat a secret bypass, while a
+ * command-position anchor (line start or a separator before the word) keeps
+ * `nohup curl`, `xargs curl`, and `echo a && curl` detected. */
+const NETWORK_CLIENT_WORD = /(?:^|[\s;&|(])(?:curl|wget|invoke-webrequest|iwr|irm|rsync|ssh|scp)\b/i
+
 function hasDeletePrimitive(text: string): boolean {
   const stripped = text.replace(/'[^']*'/g, "").replace(/"(?:[^"]|"")*"/g, "")
   return DELETE_PRIMITIVE.test(stripped)
@@ -320,9 +332,23 @@ function isDangerousFindRoot(root: string): boolean {
   if (r === ".." || r.startsWith("../")) return true
   const lower = r.toLowerCase()
   if (lower === "/") return true
-  return ["/etc", "/var", "/boot", "/usr", "/bin", "/sbin", "/home", "/root", "/opt", "/sys", "/proc", "/mnt"].some(
-    (p) => lower === p || lower.startsWith(p + "/"),
-  )
+  return [
+    "/etc",
+    "/var",
+    "/boot",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/home",
+    "/root",
+    "/opt",
+    "/srv",
+    "/sys",
+    "/proc",
+    "/mnt",
+  ].some((p) => lower === p || lower.startsWith(p + "/"))
 }
 
 function findDangerousDeleteRoot(text: string): boolean {
@@ -360,10 +386,16 @@ function hasForkBomb(text: string): boolean {
     }
     if (depth !== 0 || closeIdx >= stripped.length) continue
     const body = stripped.slice(braceIdx + 1, closeIdx)
-    if (!body.includes("|") || !body.includes(name)) continue
+    // Recursion core: the function's own name on BOTH sides of a pipe inside
+    // the body (`:(){ :|:& };:`, `bomb(){ bomb|bomb& };bomb`). A name that
+    // merely appears elsewhere in the body (`npm run build | tee log`) is not
+    // recursion.
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const pipeRecursion = new RegExp(`${escaped}\\s*\\|\\s*${escaped}(?![\\w:.*-])`)
+    if (!body.includes("|") || !pipeRecursion.test(body)) continue
     if (body.includes("&")) return true
     const after = stripped.slice(closeIdx + 1).replace(/^[\s;&]*/, "")
-    if (after.startsWith(name)) return true
+    if (new RegExp(`^${escaped}(?![\\w:.*-])`).test(after)) return true
   }
   if (/\bwhile\s+(?:true|1|:|\[[^\]]*\])\b[^;]*;\s*do\s+[^;]*\$0\s*&/.test(stripped)) return true
   // pipe self-reference: name | name & (linear scan, no backreference)
@@ -979,9 +1011,16 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   },
   {
     id: "filesystem.root-delete",
-    reason: "Attempts broad recursive deletion at a filesystem, home, or working-directory root",
+    reason: "Attempts broad recursive deletion at a filesystem, home, or system-critical root",
     test: (text) =>
-      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?(?:\/|~\/?|\.\.?\/?|\*)(?:\s|$|[;&|])/im.test(text) ||
+      // `rm -rf /`, `/etc`, `/usr`, `/boot`, ... — system-critical roots are
+      // floor: never bypassable by the filesystem category.
+      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?(?:\/|~\/?|\.\.?\/?|\*|\/(?:etc|usr|bin|sbin|boot|var|home|root|opt|lib|srv)(?:\/|\*|$))(?:\s|$|[;&|])/im.test(
+        text,
+      ) ||
+      /\brm\s+(?:-[a-z]*[rf][a-z]*\s+)+(?:--no-preserve-root\s+)?\/(?:etc|usr|bin|sbin|boot|var|home|root|opt|lib|srv)(?:[/*\s]|$)/im.test(
+        text,
+      ) ||
       /\b(?:rmdir|rd)\s+\/s\s+\/q\s+(?:[a-z]:\\|\\|\/|\.\.?|\*)(?:\s|$)/im.test(text) ||
       /\bdel\s+\/[a-z]*s[a-z]*\s+\/[a-z]*q[a-z]*\s+(?:[a-z]:\\|\\|\/|\*)(?:\s|$)/im.test(text) ||
       /\bremove-item\b[^\n]*(?:-recurse[^\n]*-force|-force[^\n]*-recurse)[^\n]*(?:[a-z]:\\(?:\*|$)|\/(?:\*|$)|~(?:\/|\s|$)|\.\.?(?:\/|\s|$)|\*)(?:\s|$)/im.test(
@@ -1071,12 +1110,26 @@ const SECURITY_SIGNAL_RULES: Rule[] = [
   {
     id: "filesystem.kernel-trigger",
     reason: "Attempts to write the kernel sysrq trigger or crash mechanisms",
-    test: (text) => /(?:>\s*|of=)[^\n]*\/proc\/sysrq-trigger\b/i.test(text),
+    // Redirect / dd-of writes (baseline form) plus pipe/copy writers; `tee`
+    // always writes to its file argument, copy commands only when the trigger
+    // is the destination (trailing path, not a source). Pipe forms span `|`
+    // segment splits.
+    test: (text) =>
+      /(?:>\s*|\bof=)[^\n]*\/proc\/sysrq-trigger\b/i.test(text) ||
+      /\btee\b[^\n]*\/proc\/sysrq-trigger\b/i.test(text) ||
+      /\b(?:cp|mv|rsync|install)\b[^\n|;&]*\s\/proc\/sysrq-trigger\s*(?:[|;&\n]|$)/i.test(text),
   },
   {
     id: "filesystem.kernel-core-pattern",
     reason: "Attempts to set a piped core_pattern (kernel code execution)",
-    test: (text) => /\/proc\/sys\/kernel\/core_pattern\b[^\n]*\||\|[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text),
+    // Any write to core_pattern is the floor: redirect/dd-of, tee, or copy
+    // commands with it as the trailing destination. Piping INTO a program
+    // (`| /usr/bin/crash`) is the code-exec form and is covered by the same
+    // write markers.
+    test: (text) =>
+      /(?:>\s*|\bof=)[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text) ||
+      /\btee\b[^\n]*\/proc\/sys\/kernel\/core_pattern\b/i.test(text) ||
+      /\b(?:cp|mv|rsync|install)\b[^\n|;&]*\s\/proc\/sys\/kernel\/core_pattern\s*(?:[|;&\n]|$)/i.test(text),
   },
   {
     id: "permissions.root-recursive",
@@ -3420,6 +3473,7 @@ async function classifyHardDeletionPolicy(
 ): Promise<StaticSecurityDecision | undefined> {
   const surfaces = [segment, ...extractDecodedPayloads(segment), ...extractQuotedWrappers(segment)]
   const combined = surfaces.join("\n\n")
+  const bypassed = input.bypassedCategories
 
   // HARD-mode exemption for clearing recognized disposable directories inside
   // the working tree (node_modules, dist, .venv, .next, out, ... §4.9).
@@ -3444,7 +3498,7 @@ async function classifyHardDeletionPolicy(
     commandSubstitutionBodies(segment).length === 0 &&
     /^(?:echo|printf|write-output|write-host)\b/i.test(stripHarmlessPrefixes(segment).trim())
 
-  if (hasForcedRecursiveDelete(combined) && !inertOutput) {
+  if (hasForcedRecursiveDelete(combined) && !inertOutput && !ruleBypassed("hard.forced-recursive-delete", bypassed)) {
     return {
       verdict: "DENY",
       rules: ["hard.forced-recursive-delete"],
@@ -3481,7 +3535,7 @@ async function classifyHardDeletionPolicy(
           worktree: input.worktree,
           strictness: "HARD",
         })
-        if (pathFinding.kind === "deny") {
+        if (pathFinding.kind === "deny" && !ruleBypassed(pathFinding.rule, bypassed)) {
           return {
             verdict: "DENY",
             rules: [pathFinding.rule],
@@ -3489,7 +3543,7 @@ async function classifyHardDeletionPolicy(
             fingerprints: [],
           }
         }
-        if (hasNamedTempPathSegment(cleaned)) {
+        if (hasNamedTempPathSegment(cleaned) && !ruleBypassed("hard.temp-target-delete", bypassed)) {
           return {
             verdict: "DENY",
             rules: ["hard.temp-target-delete"],
@@ -3498,7 +3552,7 @@ async function classifyHardDeletionPolicy(
           }
         }
         const literal = literalPathToken(target)
-        if (literal && backupPathIdentity(literal)) {
+        if (literal && backupPathIdentity(literal) && !ruleBypassed("hard.backup-target-delete", bypassed)) {
           return {
             verdict: "DENY",
             rules: ["hard.backup-target-delete"],
@@ -3506,7 +3560,12 @@ async function classifyHardDeletionPolicy(
             fingerprints: [],
           }
         }
-        if (base && roots.length > 0 && (await isTrustedTempPath(target, base, roots))) {
+        if (
+          base &&
+          roots.length > 0 &&
+          (await isTrustedTempPath(target, base, roots)) &&
+          !ruleBypassed("hard.local-temp-delete", bypassed)
+        ) {
           return {
             verdict: "DENY",
             rules: ["hard.local-temp-delete"],
@@ -3575,6 +3634,7 @@ async function classifySegment(
 ): Promise<SegmentDecision> {
   const segInput: InternalClassifyInput = { ...input, script: segment, cwd: base }
   const strictness: Strictness = input.strictness ?? "LOOSE"
+  const bypassed = input.bypassedCategories
 
   if (segment.trim().startsWith("#")) {
     return {
@@ -3593,17 +3653,22 @@ async function classifySegment(
   }
 
   if (hasForbiddenRecycleDestruction(segment)) {
-    return {
-      verdict: "DENY",
-      rules: ["filesystem.recycle-bin-permanent-delete"],
-      reason: "Permanently deleting recycle-bin contents is forbidden",
+    // Recycle-bin permanent deletion follows the filesystem bypass category.
+    if (!bypassed?.has("filesystem")) {
+      return {
+        verdict: "DENY",
+        rules: ["filesystem.recycle-bin-permanent-delete"],
+        reason: "Permanently deleting recycle-bin contents is forbidden",
+      }
     }
   }
 
   const recycle = explicitRecycleBinOperation(segment, input.shell)
-  if (recycle) {
+  if (recycle && !bypassed?.has("filesystem")) {
     const recycleFinding = await recycleTargetsFinding(recycle.targets, base, segInput, strictness)
-    if (recycleFinding) return recycleFinding
+    if (recycleFinding && !recycleFinding.rules.every((rule) => ruleBypassed(rule, bypassed))) {
+      return recycleFinding
+    }
     if (strictness === "HARD") {
       const tempRoots = await trustedUserLocalTempRoots(segInput)
       for (const target of recycle.targets) {
@@ -3612,7 +3677,7 @@ async function classifySegment(
           literal && (backupPathIdentity(literal) || hasNamedTempPathSegment(literal)),
         )
         const inLocalTemp = tempRoots.length > 0 && await isTrustedTempPath(target, base, tempRoots)
-        if (protectedTarget || inLocalTemp) {
+        if ((protectedTarget || inLocalTemp) && !ruleBypassed("filesystem.protected-target-delete", bypassed)) {
           return {
             verdict: "DENY",
             rules: ["filesystem.protected-target-delete"],
@@ -3620,14 +3685,14 @@ async function classifySegment(
           }
         }
       }
-      if (recycle.targets.some(isCriticalDeletionTarget)) {
+      if (recycle.targets.some(isCriticalDeletionTarget) && !ruleBypassed("data.critical-delete", bypassed)) {
         return {
           verdict: "DENY",
           rules: ["data.critical-delete"],
           reason: `Attempts to delete credential or key material. ${PERMANENT_DELETE_GUIDANCE}`,
         }
       }
-      if (recycle.targets.some(isGeneralDataTarget)) {
+      if (recycle.targets.some(isGeneralDataTarget) && !ruleBypassed("data.destructive-delete", bypassed)) {
         return {
           verdict: "DENY",
           rules: ["data.destructive-delete"],
@@ -3654,12 +3719,14 @@ async function classifySegment(
   }
 
   if (strictness === "HARD") {
+    // Deletion/backup policies gate their individual DENY verdicts with
+    // ruleBypassed (filesystem vs secret categories differ per rule).
     const hardDecision = await classifyHardDeletionPolicy(segment, segInput)
-    if (hardDecision) {
+    if (hardDecision && !hardDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
       return { verdict: hardDecision.verdict, rules: hardDecision.rules, reason: hardDecision.reason }
     }
     const backupDecision = await classifyBackupPolicy(segment, segInput)
-    if (backupDecision) {
+    if (backupDecision && !backupDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
       if (backupDecision.verdict === "ALLOW" && backupDecision.rules.includes("filesystem.backup-delete")) {
         return {
           verdict: "DENY",
@@ -3672,12 +3739,15 @@ async function classifySegment(
   } else {
     if (!segInput.cwdUnknown) {
       const namedTempDecision = await classifyNamedTempDeletionPolicy(segment, segInput)
-      if (namedTempDecision) {
+      if (namedTempDecision && !namedTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
         return { verdict: namedTempDecision.verdict, rules: namedTempDecision.rules, reason: namedTempDecision.reason }
       }
 
       const userLocalTempDecision = await classifyUserLocalTempSegment(segment, segInput)
-      if (userLocalTempDecision) {
+      if (
+        userLocalTempDecision &&
+        !userLocalTempDecision.rules.every((rule) => ruleBypassed(rule, bypassed))
+      ) {
         return {
           verdict: userLocalTempDecision.verdict,
           rules: userLocalTempDecision.rules,
@@ -3685,7 +3755,7 @@ async function classifySegment(
         }
       }
       const backupDecision = await classifyBackupPolicy(segment, segInput)
-      if (backupDecision) {
+      if (backupDecision && !backupDecision.rules.every((rule) => ruleBypassed(rule, bypassed))) {
         return { verdict: backupDecision.verdict, rules: backupDecision.rules, reason: backupDecision.reason }
       }
     }
@@ -3714,7 +3784,7 @@ async function classifySegment(
   const m3ctx: PathContext = { cwd: base, worktree: input.worktree, strictness }
 
   const tarOrUnzip = classifyTarExtractOrUnzip(segment, m3ctx, strictness, /^unzip\b/i.test(segment))
-  if (tarOrUnzip) return tarOrUnzip
+  if (tarOrUnzip && !tarOrUnzip.rules.every((rule) => ruleBypassed(rule, bypassed))) return tarOrUnzip
 
   if ((/^curl\b/i.test(segment) || /^wget\b/i.test(segment)) && strictness === "LOOSE" && !input.cwdUnknown) {
     if (isSafeDownloadTarget(segment, m3ctx)) {
@@ -3774,7 +3844,9 @@ async function classifySegment(
     if (heredocFinding.kind === "pass") {
       return { verdict: "ALLOW", rules: ["operation.heredoc"], reason: "Writes recognized heredoc content to stdout or a working-tree file" }
     }
-    return { verdict: heredocFinding.kind === "deny" ? "DENY" : "ASK", rules: [heredocFinding.rule], reason: heredocFinding.reason }
+    if (!ruleBypassed(heredocFinding.rule, bypassed)) {
+      return { verdict: heredocFinding.kind === "deny" ? "DENY" : "ASK", rules: [heredocFinding.rule], reason: heredocFinding.reason }
+    }
   }
 
   const ansiSurfaces = decodeAnsiCContent(segment)
@@ -3814,6 +3886,7 @@ async function classifySegment(
   // provably-safe early allow (e.g. `echo '|/bin/evil' > /proc/sys/kernel/core_pattern`).
   // Other DEFINITE rules keep running after EXIT-1 so that harmless echo/printf of
   // delete strings (`echo 'rm -rf /'`) are not misclassified as deletions.
+  // Kernel primitives are floor rules: never bypassable.
   for (const ruleId of ["filesystem.kernel-trigger", "filesystem.kernel-core-pattern"]) {
     const rule = SECURITY_SIGNAL_RULES.find((entry) => entry.id === ruleId)
     if (rule && rule.test(combined)) {
@@ -3826,7 +3899,7 @@ async function classifySegment(
     if (finding.kind === "pass") {
       // Durable-data in-place overwrite must not ride the provably-safe early
       // allow (`sed -i` on .csv/.json/db/sqlite/xlsx/parquet).
-      if (hasDestructiveOverwrite(segment)) {
+      if (!bypassed?.has("filesystem") && hasDestructiveOverwrite(segment)) {
         return {
           verdict: "ASK",
           rules: ["data.destructive-overwrite"],
@@ -3839,14 +3912,17 @@ async function classifySegment(
         reason: "The segment is a recognized read-only or normal low-risk development action",
       }
     }
-    return {
-      verdict: finding.kind === "deny" ? "DENY" : "ASK",
-      rules: [finding.rule],
-      reason: finding.reason,
+    if (!ruleBypassed(finding.rule, bypassed)) {
+      return {
+        verdict: finding.kind === "deny" ? "DENY" : "ASK",
+        rules: [finding.rule],
+        reason: finding.reason,
+      }
     }
   }
 
   for (const rule of SECURITY_SIGNAL_RULES) {
+    if (ruleBypassed(rule.id, bypassed)) continue
     if (rule.test(combined)) {
       if (DEFINITE_DESTRUCTIVE_RULES.has(rule.id)) {
         if (rule.id === "filesystem.forced-recursive-delete" && explicitDisposableCleanup && strictness !== "HARD") continue
@@ -3861,11 +3937,13 @@ async function classifySegment(
     worktree: input.worktree,
     strictness,
   })
-  if (compressionFinding) {
+  if (compressionFinding && !compressionFinding.rules.every((rule) => ruleBypassed(rule, bypassed))) {
     return { verdict: compressionFinding.verdict, rules: compressionFinding.rules, reason: compressionFinding.reason }
   }
 
-  if (hasCriticalDataDestruction(combined)) {
+  // Credential/key-material data rules belong to the secret category: arming
+  // `secret` clears them; arming `filesystem` alone must not.
+  if (!bypassed?.has("secret") && hasCriticalDataDestruction(combined)) {
     return {
       verdict: "DENY",
       rules: ["data.critical-delete"],
@@ -3874,7 +3952,7 @@ async function classifySegment(
         : "Attempts to delete credential or key material",
     }
   }
-  if (hasGeneralDataDestruction(combined)) {
+  if (!bypassed?.has("filesystem") && hasGeneralDataDestruction(combined)) {
     if (strictness === "HARD") {
       return {
         verdict: "DENY",
@@ -3887,7 +3965,7 @@ async function classifySegment(
       "Attempts to delete user data or durable structured files and requires review",
     )
   }
-  if (hasDestructiveOverwrite(combined)) {
+  if (!bypassed?.has("filesystem") && hasDestructiveOverwrite(combined)) {
     reviewSignals.set(
       "data.destructive-overwrite",
       "Attempts in-place destructive modification of durable structured data",
@@ -3895,10 +3973,12 @@ async function classifySegment(
   }
   const sensitivePath = sensitivePathFinding(segment, { cwd: base, worktree: input.worktree, strictness })
   if (sensitivePath && sensitivePath.kind !== "pass") {
-    return {
-      verdict: sensitivePath.kind === "deny" ? "DENY" : "ASK",
-      rules: [sensitivePath.rule],
-      reason: sensitivePath.reason,
+    if (!ruleBypassed(sensitivePath.rule, bypassed)) {
+      return {
+        verdict: sensitivePath.kind === "deny" ? "DENY" : "ASK",
+        rules: [sensitivePath.rule],
+        reason: sensitivePath.reason,
+      }
     }
   }
 
@@ -3907,7 +3987,7 @@ async function classifySegment(
     worktree: input.worktree,
     strictness,
   })
-  if (exfilRule) {
+  if (exfilRule && !ruleBypassed(exfilRule, bypassed)) {
     const reason = exfilRule === "permissions.sensitive-mode"
       ? "Setting dangerous permissions on a credential or system file requires review"
       : "Sending credential or system data off-host requires review"
@@ -3918,6 +3998,7 @@ async function classifySegment(
   }
 
   for (const rule of HARD_DENY_LOOSE_ASK_RULES) {
+    if (ruleBypassed(rule.id, bypassed)) continue
     if (rule.test(combined)) {
       if (strictness === "HARD") {
         return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
@@ -3941,7 +4022,7 @@ async function classifySegment(
     }
   }
 
-  if (localScriptCandidates(segment, input.shell).length > 0) {
+  if (localScriptCandidates(segment, input.shell).length > 0 && !ruleBypassed("execution.local-script", bypassed)) {
     return {
       verdict: "ASK",
       rules: ["execution.local-script"],
@@ -3949,19 +4030,29 @@ async function classifySegment(
     }
   }
 
-  if (
-    WRAPPER_PRIMITIVE.test(combined) ||
-    hasDynamicShellExpansion(combined, input.shell) ||
-    extractDecodedPayloads(segment).length > 0
-  ) {
+  if (!bypassed?.has("filesystem") && WRAPPER_PRIMITIVE.test(combined)) {
     return {
       verdict: "ASK",
       rules: ["execution.wrapper"],
       reason: "The command uses an interpreter, encoded payload, or dynamic execution wrapper",
     }
   }
+  if (!bypassed?.has("filesystem") && hasDynamicShellExpansion(combined, input.shell)) {
+    return {
+      verdict: "ASK",
+      rules: ["execution.wrapper"],
+      reason: "The command uses dynamic shell expansion and cannot be proven safe",
+    }
+  }
+  if (!bypassed?.has("filesystem") && extractDecodedPayloads(segment).length > 0) {
+    return {
+      verdict: "ASK",
+      rules: ["execution.wrapper"],
+      reason: "The command carries an encoded payload that requires review",
+    }
+  }
 
-  if (hasDeletePrimitive(combined)) {
+  if (!bypassed?.has("filesystem") && hasDeletePrimitive(combined)) {
     return {
       verdict: "ASK",
       rules: ["filesystem.scoped-delete"],
@@ -3969,16 +4060,19 @@ async function classifySegment(
     }
   }
 
+  // Composite context-required check: each trigger family follows the category
+  // of its primitive so an armed category actually clears its family. Network
+  // clients are matched as command words only — a bare `\bssh\b` would also hit
+  // paths like `~/.ssh/id_rsa` and wrongly defeat a secret bypass.
   const combinedWithoutFdMerges = combined
     .replace(/>\s*\/dev\/(?:null|stdout|stderr)\b/gi, "")
     .replace(/>\s*\$null\b/gi, "")
     .replace(/\d*>&\d+/g, "")
-  if (
-    /\b(?:kill|pkill|killall|taskkill|stop-process)\b/i.test(combined) ||
-    /\b(?:curl|wget|invoke-webrequest|iwr|irm|ssh|scp|rsync)\b/i.test(combined) ||
-    /\b(?:sudo|runas)\b/i.test(combined) ||
-    /(?:^|[^>])>(?!>)/m.test(combinedWithoutFdMerges)
-  ) {
+  const killTrigger = !bypassed?.has("os") && /\b(?:kill|pkill|killall|taskkill|stop-process)\b/i.test(combined)
+  const networkTrigger = !bypassed?.has("web") && NETWORK_CLIENT_WORD.test(combined)
+  const privilegeTrigger = !bypassed?.has("os") && /\b(?:sudo|runas)\b/i.test(combined)
+  const overwriteTrigger = !bypassed?.has("filesystem") && /(?:^|[^>])>(?!>)/m.test(combinedWithoutFdMerges)
+  if (killTrigger || networkTrigger || privilegeTrigger || overwriteTrigger) {
     return {
       verdict: "ASK",
       rules: ["operation.context-required"],
@@ -3986,6 +4080,19 @@ async function classifySegment(
     }
   }
 
+  // With any trigger-family category armed, the surviving fallback describes
+  // itself as bypass-gated: the armed BYPASS RULE lets the dynamic reviewer
+  // decide consistently instead of reading "unprovable" as high-risk.
+  if (
+    bypassed &&
+    (bypassed.has("filesystem") || bypassed.has("os") || bypassed.has("secret") || bypassed.has("web"))
+  ) {
+    return {
+      verdict: "ASK",
+      rules: ["bypass.static-allow"],
+      reason: "Static checks are disabled for this command's categories by a user-armed bypass",
+    }
+  }
   return {
     verdict: "ASK",
     rules: ["operation.unknown"],
@@ -4115,12 +4222,18 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     }
   }
   const executableSurfaces = [source, ...extractDecodedPayloads(source), ...extractQuotedWrappers(source)]
+  const bypassed = input.bypassedCategories
   // Pipe-separated segments are classified individually, so remote-pipe
   // (`curl ... | bash`) must be judged on the full script. HARD mode denies
   // download-and-execute outright; LOOSE defers it to the dynamic reviewer
   // (which applies the official-installer rule).
   const remotePipeRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.remote-pipe")
-  if ((input.strictness ?? "LOOSE") === "HARD" && remotePipeRule && remotePipeRule.test(source)) {
+  if (
+    (input.strictness ?? "LOOSE") === "HARD" &&
+    remotePipeRule &&
+    !ruleBypassed("execution.remote-pipe", bypassed) &&
+    remotePipeRule.test(source)
+  ) {
     return {
       verdict: "DENY",
       rules: ["execution.remote-pipe"],
@@ -4129,11 +4242,28 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     }
   }
   // Reverse shells / xargs deletion may span `|`/`;` segments, so judge them
-  // on the full script (both modes: these are DEFINITE-destructive).
+  // on the full script (both modes: these are DEFINITE-destructive). Reverse
+  // shells are floor rules and never bypassable.
   const reverseShellRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "network.reverse-shell")
   const xargsRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.xargs-destructive")
   for (const rule of [reverseShellRule, xargsRule]) {
-    if (rule && rule.test(source)) {
+    if (!rule || ruleBypassed(rule.id, bypassed)) continue
+    if (rule.test(source)) {
+      return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
+    }
+  }
+  // Floor rules that can span `|`/`&` segment splits: fork bombs (the `&`
+  // inside the function body splits the pattern) and kernel-trigger /
+  // kernel-core-pattern writes via `tee`/`cp`-style pipes. `splitCommandSegments`
+  // runs before the per-segment SECURITY_SIGNAL_RULES loop, so the per-segment
+  // check alone never sees the full shape; these are floor rules (never
+  // bypassable) and DEFINITE-destructive, so DENY on the full script up front.
+  const forkBombRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "execution.fork-bomb")
+  const kernelTriggerRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.kernel-trigger")
+  const kernelCorePatternRule = SECURITY_SIGNAL_RULES.find((rule) => rule.id === "filesystem.kernel-core-pattern")
+  for (const rule of [forkBombRule, kernelTriggerRule, kernelCorePatternRule]) {
+    if (!rule || ruleBypassed(rule.id, bypassed)) continue
+    if (rule.test(executableSurfaces.join("\n\n"))) {
       return { verdict: "DENY", rules: [rule.id], reason: rule.reason, fingerprints: [] }
     }
   }
@@ -4223,7 +4353,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
     return { verdict: "DENY", rules: segmentDecision.rules, reason: segmentDecision.reason, ...decisionState }
   }
 
-  if (deletionTargets.truncated) {
+  if (deletionTargets.truncated && !bypassed?.has("filesystem")) {
     return {
       verdict: "ASK",
       rules: [...new Set([...segmentDecision.rules, "filesystem.deletion-targets-truncated"])],
@@ -4248,12 +4378,14 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
 
   const extraSignals = new Map<string, string>()
   for (const rule of SECURITY_SIGNAL_RULES) {
+    if (ruleBypassed(rule.id, bypassed)) continue
     if (rule.id === "execution.remote-pipe" && rule.test(executableCombined)) {
       extraSignals.set(rule.id, rule.reason)
     }
   }
   if (localScriptCombined) {
     for (const rule of SECURITY_SIGNAL_RULES) {
+      if (ruleBypassed(rule.id, bypassed)) continue
       if (rule.test(localScriptCombined)) extraSignals.set(rule.id, rule.reason)
     }
     // Exfiltration primitives inside an inspected script must surface as review
@@ -4264,7 +4396,7 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
       worktree: input.worktree,
       strictness: input.strictness ?? "LOOSE",
     })
-    if (scriptExfil) {
+    if (scriptExfil && !ruleBypassed(scriptExfil, bypassed)) {
       extraSignals.set(
         scriptExfil,
         scriptExfil === "permissions.sensitive-mode"
@@ -4272,16 +4404,16 @@ export async function classifyShellCommand(input: ClassifyShellCommandInput): Pr
           : "The local script sends credential or system data off-host and requires review",
       )
     }
-    if (hasCriticalDataDestruction(localScriptCombined)) {
+    if (!ruleBypassed("data.critical-delete", bypassed) && hasCriticalDataDestruction(localScriptCombined)) {
       extraSignals.set("data.critical-delete", "Local script may delete credential or key material and requires review")
     }
-    if (hasGeneralDataDestruction(localScriptCombined)) {
+    if (!ruleBypassed("data.destructive-delete", bypassed) && hasGeneralDataDestruction(localScriptCombined)) {
       extraSignals.set("data.destructive-delete", "Local script may delete durable data and requires semantic review")
     }
-    if (hasDestructiveOverwrite(localScriptCombined)) {
+    if (!ruleBypassed("data.destructive-overwrite", bypassed) && hasDestructiveOverwrite(localScriptCombined)) {
       extraSignals.set("data.destructive-overwrite", "Local script may overwrite durable data and requires semantic review")
     }
-    if (hasLocalScriptReviewSignal(localScriptCombined)) {
+    if (hasLocalScriptReviewSignal(localScriptCombined) && !ruleBypassed("execution.local-script-signal", bypassed)) {
       extraSignals.set("execution.local-script-signal", "Local script contains a review-requiring primitive")
     }
   }

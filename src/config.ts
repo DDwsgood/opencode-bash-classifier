@@ -12,6 +12,17 @@ import {
 export type Strictness = "LOOSE" | "HARD"
 export type FailPolicy = "fail_ask" | "fail_open" | "fail_close"
 
+/** Escape-hatch categories the user can arm permanently (config.json
+ * `BypassClassifier`) or per-session (`/bypass-classifier`). `dynamic` skips the
+ * dynamic reviewer entirely; the others disable matching static rule groups
+ * and relax the dynamic reviewer's prompt for that session. */
+export const BYPASS_CATEGORIES = ["filesystem", "os", "secret", "dynamic", "web"] as const
+export type BypassCategory = (typeof BYPASS_CATEGORIES)[number]
+
+const DEFAULT_BYPASS_LEASE_TTL_MS = 20 * 60 * 1000
+const MIN_BYPASS_LEASE_TTL_MS = 60_000
+const MAX_BYPASS_LEASE_TTL_MS = 24 * 60 * 60 * 1000
+
 export type DynamicReviewOptions = {
   baseURL?: string
   model?: string
@@ -62,6 +73,14 @@ export type BashClassifierOptions = {
   /** Append one JSONL line to ~/.opencode/reviewer-trace.jsonl for every
    * dynamic review (verdict or error) and every dynamic cache hit. */
   logReviewerTrace?: boolean
+  /** Permanently armed escape-hatch categories (all sessions, all clients). */
+  BypassClassifier?: BypassCategory[]
+  /** Activity-renewed lease TTL for temporary per-session bypass entries, in
+   * milliseconds. Default 20 minutes. */
+  bypassLeaseTtlMs?: number
+  /** Whether a session's temporary bypass also covers its subagent children
+   * (default true). */
+  bypassPropagateToSubagents?: boolean
   /** Test-injection only; never wired by the plugin itself. */
   reviewCommand?: ReviewCommand
   [key: string]: unknown
@@ -99,6 +118,11 @@ export type ResolvedPluginConfig = {
   failPolicy: FailPolicy
   slowCommands: ResolvedSlowCommands
   logReviewerTrace: boolean
+  bypassClassifier: ReadonlySet<BypassCategory>
+  bypassLeaseTtlMs: number
+  bypassPropagateToSubagents: boolean
+  /** Non-fatal BypassClassifier validation warnings (unknown categories). */
+  bypassWarnings: readonly string[]
   dynamicReview: ResolvedDynamicReview
   reviewCommand?: ReviewCommand
 }
@@ -115,6 +139,9 @@ const ALLOWED_TOP_LEVEL = new Set([
   "dynamicReview",
   "slowCommands",
   "logReviewerTrace",
+  "BypassClassifier",
+  "bypassLeaseTtlMs",
+  "bypassPropagateToSubagents",
   "reviewCommand",
 ])
 
@@ -395,6 +422,42 @@ function resolveDynamicReview(raw: unknown, strictness: Strictness): ResolvedDyn
   }
 }
 
+function resolveBypassCategories(raw: unknown): { value: ReadonlySet<BypassCategory>; warnings: string[] } {
+  if (raw === undefined) return { value: new Set(), warnings: [] }
+  if (!Array.isArray(raw)) throw new Error("BypassClassifier must be an array of category strings")
+  const warnings: string[] = []
+  const value = new Set<BypassCategory>()
+  for (const item of raw) {
+    if (typeof item !== "string") {
+      warnings.push("BypassClassifier contains a non-string entry that was ignored")
+      continue
+    }
+    const category = BYPASS_CATEGORIES.find((entry) => entry === item.trim())
+    if (!category) {
+      warnings.push(`BypassClassifier contains an unknown category "${item.trim()}" that was ignored`)
+      continue
+    }
+    value.add(category)
+  }
+  return { value, warnings }
+}
+
+function resolveBypassLeaseTtlMs(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_BYPASS_LEASE_TTL_MS
+  if (
+    typeof raw !== "number" ||
+    !Number.isFinite(raw) ||
+    !Number.isInteger(raw) ||
+    raw < MIN_BYPASS_LEASE_TTL_MS ||
+    raw > MAX_BYPASS_LEASE_TTL_MS
+  ) {
+    throw new Error(
+      `bypassLeaseTtlMs must be an integer between ${MIN_BYPASS_LEASE_TTL_MS} and ${MAX_BYPASS_LEASE_TTL_MS}`,
+    )
+  }
+  return raw
+}
+
 export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPluginConfig {
   const source = raw ?? {}
 
@@ -524,6 +587,16 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     logReviewerTrace = source.logReviewerTrace
   }
 
+  const bypass = resolveBypassCategories(source.BypassClassifier)
+  const bypassLeaseTtlMs = resolveBypassLeaseTtlMs(source.bypassLeaseTtlMs)
+  let bypassPropagateToSubagents = true
+  if (source.bypassPropagateToSubagents !== undefined) {
+    if (typeof source.bypassPropagateToSubagents !== "boolean") {
+      throw new Error("bypassPropagateToSubagents must be a boolean")
+    }
+    bypassPropagateToSubagents = source.bypassPropagateToSubagents
+  }
+
   const dynamicReview = resolveDynamicReview(source.dynamicReview, strictness)
   const routeReview = configuredReviewCommand ?? (dynamicReview.available ? reviewCommandWithAuditor : undefined)
   const reviewCommand: ReviewCommand | undefined = routeReview
@@ -545,7 +618,11 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     failPolicy,
     slowCommands,
     logReviewerTrace,
+    bypassClassifier: bypass.value,
+    bypassLeaseTtlMs,
+    bypassPropagateToSubagents,
     dynamicReview,
     reviewCommand,
+    bypassWarnings: bypass.warnings,
   }
 }

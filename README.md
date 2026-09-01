@@ -48,12 +48,48 @@
 
 ### 目录自动发现与配置文件兜底
 
-插件目录被自动发现时拿不到 `options`。此时插件会依次尝试：
+配置按**三层合并**（后层逐字段覆盖前层）：
 
-1. `options.configFile`（`plugins` 配置项里显式给出时）；
-2. 插件根目录下的 `config.json`（自动发现场景的兜底文件）。
+1. 插件根目录下的 `config.json`——**始终读取的基础层**（自动发现场景的兜底文件，也适合存放长期固定的设置，如 `BypassClassifier`、审查器凭据）；
+2. `options.configFile`——`plugins` 配置项里显式给出的 JSON 文件；
+3. `plugins` 配置项里的 `options`——逐字段覆盖。
 
-配置文件是 JSON 对象，字段与下方 `options` 字段一致；`configFile` 本身不是插件字段，不会被传给配置校验。
+配置文件是 JSON 对象，字段与下方 `options` 字段一致；`configFile` 本身是加载器指令，不是插件字段，不会被传给配置校验。config.json 解析失败会打警告并回退默认值（安全设置静默失效比报错更危险）；`configFile` 读取失败则直接抛错。
+
+## BypassClassifier（误判逃逸路径）
+
+为降低误判与过度谨慎，用户可按类别豁免检查。两类机制：
+
+**永久豁免**——`config.json`（或 options）里：
+
+```json
+{ "BypassClassifier": ["filesystem", "secret"] }
+```
+
+**临时豁免**——会话内 slash 命令 `/bypass-classifier <category|all|off>`（服务端注册命令，参数不进模型上下文）。实现为**活动续期租约**：内存存储，默认 TTL 20 分钟（`bypassLeaseTtlMs` 可调，1min–24h），会话有活动事件（查看、收件、执行、shell 启动）即续期；关掉 TUI 或服务重启后失效，必须重新 arm。
+
+- 多次 arm 叠加：`/bypass-classifier os` 后再 `/bypass-classifier web` = {os, web}；`off` 清空；`off os` 清空后只 arm os。
+- **子代理传导**（默认开，`bypassPropagateToSubagents: false` 关闭）：子代理会话继承父会话（沿祖先链并集）的 armed 类别；子代理干活会续期父会话租约。
+
+### 类别语义
+
+| 类别 | 豁免内容 |
+|---|---|
+| `filesystem` | 文件系统检查：项目文件删除、数据破坏、重定向覆写、归档解包等 |
+| `os` | 系统/进程/权限管理：systemctl、kill、sudo、sysctl、crontab、modprobe 等 |
+| `secret` | 凭据/敏感文件检查：`.env`、`~/.ssh/*`、`/etc/shadow`、`/proc/*/environ` 的读取/修改/删除 |
+| `web` | 所有网络目的地可信：curl/wget/ssh/scp/rsync 的目标、destructive API、防火墙变更 |
+| `dynamic` | **跳过动态 LLM 审查器**（静态层仍生效；审查器不可用时走 `failPolicy`） |
+
+规则按所属类别归属豁免（如 `data.critical-delete` 属 `secret` 而非 `filesystem`：arm filesystem 仍拦凭据文件删除，arm secret+filesystem 才放行）。
+
+### 不可绕过底线
+
+以下规则任何类别都不豁免：`filesystem.root-delete`（含 `/etc`、`/usr`、`/lib`、`/boot`、`/srv` 等系统根）、`brace-root-delete`、`root-glob-delete`、`find-delete-root`（同上系统根）、`disk-destruction`、`execution.fork-bomb`（含 `:(){ :|:& };:` 全形状，跨段判定）、`kernel-trigger`、`kernel-core-pattern`（含 `tee`/`cp`/`mv` 管道与拷贝写入形式）、`network.reverse-shell`、`execution.literal-shell`。这些规则在**完整脚本**上判定，不受 `|`/`&`/`;` 段拆分影响。动态审查器的 BYPASS RULE 提示词同样声明这些保持 DENY。
+
+### 静态放行语义
+
+arm 后命令不会被静态层直接 ALLOW：豁免对应检查后以 `bypass.static-allow` ASK 交动态审查器（配合对应 BYPASS RULE 提示词裁决），保持 fail-close。无 bypass 的会话行为与旧版完全一致。
 
 ## 行为总览
 
@@ -67,7 +103,7 @@ shell 请求
                    DENY  -> 拒绝（HARD：绕过尝试还会中断会话）
 ```
 
-静态分类（LOOSE/HARD 策略、cd 追踪、脚本指纹、目录清单等）与 v1 `-next` **逐字节一致**（`src/security/classifier.ts`、`src/security/reviewer.ts`、`src/security/auditor.py` 原样复制）。动态审查器完全直连 OpenAI-compatible 端点，不经 opencode client。
+静态分类（LOOSE/HARD 策略、cd 追踪、脚本指纹、目录清单等）沿用 v1 `-next` 规则集（`src/security/classifier.ts`、`src/security/reviewer.ts`、`src/security/auditor.py`），在此之上新增了 bypass 类别豁免机制与审查器提示词加固（见上方 BypassClassifier 章节）。动态审查器完全直连 OpenAI-compatible 端点，不经 opencode client。
 
 ## 配置字段（与 v1 一致）
 
@@ -94,6 +130,9 @@ shell 请求
 | `logReviewerTrace` | boolean | `false` | 审计轨迹开关。为真时每次动态审查（判决或错误）及每次动态缓存命中（allow/deny）向 `~/.opencode/reviewer-trace.jsonl` 追加一行 JSONL（含时间戳、命令、endpoint/model、判决/原因/错误）；写入失败静默忽略，不影响审查流程 |
 | `supervisorEnabled` | boolean | Windows 下 `true` | 使用原生 shell supervisor |
 | `supervisorPath` | string | 包内默认 | supervisor `bash.exe` 路径 |
+| `BypassClassifier` | string[] | `[]` | 永久豁免类别列表（`filesystem`/`os`/`secret`/`dynamic`/`web`；未知类别警告并忽略） |
+| `bypassLeaseTtlMs` | number | `1200000`（20 分钟） | 临时豁免租约 TTL，活动续期；范围 60000–86400000 |
+| `bypassPropagateToSubagents` | boolean | `true` | 子代理会话继承父会话的临时豁免 |
 | `configFile` | string | — | JSON 配置文件路径（加载器指令，不是插件字段） |
 
 另支持 `reviewCommand`（仅测试注入用，插件自身从不装配）。

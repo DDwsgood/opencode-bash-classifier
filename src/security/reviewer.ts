@@ -48,6 +48,12 @@ export type CloudReviewRequest = {
   cwd: string
   previousRejectedCommand?: PreviousRejectedCommand
   previousFailedCommand?: PreviousFailedCommand
+  /** User-armed bypass categories for this session. `dynamic` never reaches
+   * the auditor (the reviewer is skipped); the rest relax the auditor prompt. */
+  userBypass?: string[]
+  /** Environment awareness: OS description and shell path, e.g.
+   * { system: "Ubuntu 24.04 WSL", bash: "/bin/bash" }. */
+  environment?: { system?: string; bash?: string }
 }
 
 export type ReviewCommandOptions = {
@@ -543,9 +549,19 @@ function normalizeReviewRequest(request: CloudReviewRequest | string): CloudRevi
   return request
 }
 
+// Categories the auditor accepts in userBypass. `dynamic` is resolved before
+// the auditor runs (the review is skipped entirely), so it never appears here.
+const BYPASS_CATEGORIES = new Set(["filesystem", "os", "secret", "web"])
+
 function requestForPolicy(request: CloudReviewRequest, policy: "LOOSE" | "HARD"): CloudReviewRequest {
   const legacy = request as CloudReviewRequest & { strictness?: unknown }
-  const { strictness: _ignoredMode, previousRejectedCommand, ...rest } = legacy
+  const {
+    strictness: _ignoredMode,
+    previousRejectedCommand,
+    userBypass,
+    environment,
+    ...rest
+  } = legacy
   const normalized: CloudReviewRequest = {
     ...rest,
     referencedPaths: Array.isArray(rest.referencedPaths) ? rest.referencedPaths : [],
@@ -554,6 +570,22 @@ function requestForPolicy(request: CloudReviewRequest, policy: "LOOSE" | "HARD")
   }
   if (policy === "HARD" && previousRejectedCommand) {
     normalized.previousRejectedCommand = previousRejectedCommand
+  }
+  if (Array.isArray(userBypass)) {
+    const categories = [...new Set(userBypass.filter((item): item is string => typeof item === "string"))].filter(
+      (item) => BYPASS_CATEGORIES.has(item),
+    )
+    if (categories.length > 0) normalized.userBypass = categories
+  }
+  if (
+    environment &&
+    typeof environment === "object" &&
+    (typeof environment.system === "string" || typeof environment.bash === "string")
+  ) {
+    normalized.environment = {
+      system: typeof environment.system === "string" ? environment.system.slice(0, 200) : undefined,
+      bash: typeof environment.bash === "string" ? environment.bash.slice(0, 200) : undefined,
+    }
   }
   return normalized
 }

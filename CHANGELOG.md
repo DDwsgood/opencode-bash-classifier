@@ -1,5 +1,87 @@
 # Changelog
 
+## 0.7.0-v2 (2026-09-01)
+
+User-configured bypass escape hatches to cut false positives and over-caution, plus
+reviewer prompt hardening. All findings from the post-implementation review round
+(A1–A3, B1–B5, C1–C2, D1–D6, E1–E4) are fixed.
+
+### Added
+- **`BypassClassifier` (permanent)**: config field listing categories whose static
+  checks are exempted — `filesystem` / `os` / `secret` / `dynamic` / `web`
+  (unknown categories warn and are ignored).
+- **`/bypass-classifier <category|all|off>` (temporary)**: server-registered slash
+  command; arguments never enter model context. Implemented as an in-memory
+  activity-renewed lease (TTL `bypassLeaseTtlMs`, default 20 min, range 1 min–24 h)
+  renewed on session activity events, expiring when the TUI stays quiet or the
+  service restarts. Arming is additive; `off` resets then arms.
+- **Subagent propagation** (`bypassPropagateToSubagents`, default on): child
+  sessions union all live ancestor leases; child activity renews ancestor leases.
+- **Non-bypassable floor**: literal root/system-root deletion (`rm -rf /`,
+  `rm -rf /etc`, brace/root-glob/find-root deletes), disk destruction, fork bombs,
+  kernel triggers, and reverse shells stay DENY under every armed category.
+- **Dynamic reviewer bypass rules**: per-category BYPASS RULE system-prompt blocks
+  (filesystem/os/secret/web) telling the model what the user declared trusted,
+  with the floor explicitly kept DENY. Environment line (OS name via
+  /etc/os-release, shell) now sent with every review.
+
+### Changed
+- **Reviewer user prompt restructured** for injection resistance: header
+  `Inspect the following command.` + environment line, command wrapped in
+  `<data></data>` with XML-escaped content (a literal `</data>` can no longer break
+  out) and `[DATA]` reminders every 1500 chars, tail anchor after the block.
+  Context JSON no longer contains the raw command.
+- **Prompt wording accuracy**: the marker claim now describes exactly which fields
+  carry `[untrusted user data]` (command, local script contents, previous-command
+  fields) instead of claiming every JSON string is marked.
+- **`config.json` layering**: the package-root `config.json` is now always the base
+  layer; `options.configFile` overlays it; `options` overlay both, field by field.
+- **`operation.unknown` fallback**: with any bypass category armed, commands whose
+  firing checks were all absorbed return `bypass.static-allow` ASK (consistent with
+  the armed BYPASS RULE at the reviewer) instead of "cannot prove safe".
+- **Network trigger matching**: network clients (`curl`/`wget`/`ssh`/`scp`/`rsync`/…)
+  are matched as command words only, so paths like `~/.ssh/id_rsa` no longer wrongly
+  defeat a `secret` bypass.
+
+### Fixed
+- Lease prune no longer drops child→parent links (only `session.deleted` clears
+  them, and deletion now also removes links pointing to the deleted parent);
+  `activeBypass` unions the whole ancestor chain; renewal covers ancestors.
+- Credential rules (`data.critical-*`, `filesystem.critical-backup`,
+  `permissions.sensitive-mode`, `filesystem.compression-sensitive`) follow the
+  `secret` category; HARD/LOOSE deletion and backup policies gate each DENY
+  per-rule, so `filesystem` alone no longer disables secret checks and `secret`
+  alone clears `rm -f .env` style deletions at the dynamic reviewer. Recycle-bin
+  findings and HARD recycle-block returns (`data.critical-delete`,
+  `data.destructive-delete`, `filesystem.protected-target-delete`) are gated the
+  same way.
+- `network.`-prefixed rules (`destructive-api`, `firewall-mutate`) now follow `web`;
+  `hard.named-temp-delete` / `hard.backup-target-delete` / `hard.local-temp-delete`
+  follow `filesystem`; `filesystem.backup-destruction` maps to `filesystem`
+  (snapshot/recovery destruction is data destruction); recycle-bin permanent
+  delete maps to `filesystem`.
+- Heredoc findings, `execution.local-script`, and `execution.local-script-signal`
+  respect armed categories.
+- **Floor hardening (segment-split evasion)**: fork bombs
+  (`:(){ :|:& };:`), kernel-trigger writes (`echo x | tee
+  /proc/sysrq-trigger`), and core_pattern writes (`… | tee
+  /proc/sys/kernel/core_pattern`, `cp … /proc/sys/kernel/core_pattern`) are now
+  judged on the full script, because the `&`/`|` inside these shapes previously
+  split them into per-segment pieces the rules never saw — the fork-bomb rule
+  did not fire on the canonical shape even without any bypass. The fork-bomb
+  predicate now requires the function name on both sides of a pipe (recursion
+  core), and the kernel predicates cover `tee`/`cp`/`mv`/`rsync`/`install`
+  writes with the target as destination.
+- `find` root-deletion floor now also covers `/lib`, `/lib64`, `/srv`.
+- Environment line reports the OS name (e.g. "Ubuntu 24.04 LTS WSL") instead of a
+  kernel release, with WSL distro-name dedup.
+- `userBypass` is sorted to match the dynamic cache key (one key ⇒ one prompt
+  ordering).
+
+### Known issues
+- None currently. (The previous fork-bomb gap — `:(){ :|:& };:` evading the
+  dedicated rule via segment splitting — was fixed with full-script floor checks.)
+
 ## 0.6.1-v2 (2026-08-26)
 
 Comprehensive audit round (attack-surface gap analysis + adversarial LLM probing of
