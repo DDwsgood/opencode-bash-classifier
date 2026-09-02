@@ -1530,6 +1530,48 @@ function backupPathIdentity(candidate: string) {
   }
 }
 
+// Backup words that mark a name as a backup when they appear as a complete
+// separator-delimited token (`config.bak`, `db-backup-2026.sql`, `hosts.old`).
+// A substring inside a larger word (`bakery.log`) never qualifies.
+const BACKUP_NAME_WORDS = new Set(["bak", "bakup", "backup", "bkup", "bck", "bckup", "old", "orig", "original"])
+
+function backupNameTokens(name: string) {
+  return name.toLowerCase().split(/[._\s-]+/).filter((token) => token.length > 0)
+}
+
+function isBackupWordToken(token: string) {
+  return BACKUP_NAME_WORDS.has(token.replace(/\d+$/, ""))
+}
+
+function obviousBackupIdentity(candidate: string) {
+  const normalizedPath = candidate.replace(/[\\/]+$/, "")
+  const name = path.basename(normalizedPath)
+  const tokens = backupNameTokens(name)
+  if (tokens.length === 0) return undefined
+  const stemTokens = tokens.filter((token) => !isBackupWordToken(token))
+  // A name that is only a backup word (`bak`, `backup`) has no stem and is
+  // not recognizable as a backup of something.
+  if (stemTokens.length === 0 || stemTokens.length === tokens.length) return undefined
+  return { backupName: name, stem: stemTokens.join(".") }
+}
+
+function similarBackupSiblingTokens(name: string) {
+  return backupNameTokens(name).filter((token) => !isBackupWordToken(token) && !/^\d+$/.test(token))
+}
+
+function hasSimilarBackupSibling(entries: Dirent[], targetName: string) {
+  const targetTokens = similarBackupSiblingTokens(targetName)
+  if (targetTokens.length === 0) return false
+  return entries.some((entry) => {
+    if (entry.name === targetName) return false
+    const siblingTokens = similarBackupSiblingTokens(entry.name)
+    return (
+      siblingTokens.length === targetTokens.length &&
+      siblingTokens.every((token, index) => token === targetTokens[index])
+    )
+  })
+}
+
 function isCriticalOriginalPath(candidate: string) {
   const original = path.basename(candidate.replace(/[\\/]+$/, "")).toLowerCase()
   return (
@@ -2151,14 +2193,16 @@ function filesystemEntryKind(info: Awaited<ReturnType<typeof lstat>>) {
 async function inspectBackupDeletionTarget(
   candidate: string,
   input: ClassifyShellCommandInput,
-): Promise<{ allowed: boolean; reason: string }> {
+): Promise<{ allowed: boolean; reason: string; sibling?: boolean }> {
   const literal = literalPathToken(candidate)
   if (!literal) return { allowed: false, reason: "Backup deletion target is not a literal path" }
   const identity = backupPathIdentity(literal)
-  if (!identity) return { allowed: false, reason: "Deletion target is not an exact backup suffix" }
-  if (isCriticalBackupTarget(literal)) {
+  const obvious = identity ? { backupName: identity.backupName, stem: identity.originalName } : obviousBackupIdentity(literal)
+  if (!identity && !obvious) return { allowed: false, reason: "Deletion target is not an obvious backup name" }
+  if (isCriticalBackupTarget(literal) || (obvious && isCriticalOriginalPath(obvious.stem))) {
     return { allowed: false, reason: "Critical credential backups cannot be deleted" }
   }
+  const loose = (input.strictness ?? "LOOSE") !== "HARD"
 
   const expanded = expandHome(literal)
   const absolute = path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(input.cwd, expanded)
@@ -2181,9 +2225,21 @@ async function inspectBackupDeletionTarget(
     return { allowed: false, reason: "Backup deletion target resolves outside the worktree" }
   }
 
-  const exactBackup = entries.find((entry) => entry.name === identity.backupName)
-  const exactOriginal = entries.find((entry) => entry.name === identity.originalName)
+  const targetName = identity ? identity.backupName : obvious!.backupName
+  const exactBackup = entries.find((entry) => entry.name === targetName)
   if (!exactBackup) return { allowed: false, reason: "Backup target does not exist with an exact name" }
+
+  // LOOSE relaxation: an obvious backup name plus a similarly named sibling in
+  // the same directory (the original or another dated copy) is deletable
+  // without the exact-original, kind, and age verification below.
+  if (loose && obvious && hasSimilarBackupSibling(entries, targetName)) {
+    return { allowed: true, reason: "Obvious backup with a similarly named sibling", sibling: true }
+  }
+
+  if (!identity) {
+    return { allowed: false, reason: "Backup has no similar sibling in the same directory" }
+  }
+  const exactOriginal = entries.find((entry) => entry.name === identity.originalName)
   if (!exactOriginal) return { allowed: false, reason: "Backup has no exact same-directory original" }
 
   let backupInfo: Awaited<ReturnType<typeof lstat>>
@@ -2295,11 +2351,18 @@ async function classifyBackupPolicy(
 
   const deletion = parseDeleteInvocation(segment)
   if (!deletion) return undefined
-  const backupTargets = deletion.targets.filter((target) => {
+  const loose = (input.strictness ?? "LOOSE") !== "HARD"
+  const identityBackupTargets = deletion.targets.filter((target) => {
     const literal = literalPathToken(target)
     return Boolean(literal && backupPathIdentity(literal))
   })
-  if (backupTargets.length === 0) {
+  const obviousBackupTargets = loose
+    ? deletion.targets.filter((target) => {
+        const literal = literalPathToken(target)
+        return Boolean(literal && !backupPathIdentity(literal) && obviousBackupIdentity(literal))
+      })
+    : []
+  if (identityBackupTargets.length === 0 && obviousBackupTargets.length === 0) {
     if (!deletion.parseable && BACKUP_SUFFIX_REFERENCE.test(segment)) {
       return {
         verdict: "DENY",
@@ -2310,7 +2373,14 @@ async function classifyBackupPolicy(
     }
     return undefined
   }
-  if (!deletion.parseable || backupTargets.length !== deletion.targets.length) {
+  if (
+    !deletion.parseable ||
+    identityBackupTargets.length + obviousBackupTargets.length !== deletion.targets.length
+  ) {
+    // Mixed verified/unverified targets keep the historical all-or-nothing DENY
+    // only when an exact-suffix backup is involved; obvious-only mixes fall
+    // through to the general pipeline (ASK → dynamic review) as before.
+    if (identityBackupTargets.length === 0) return undefined
     return {
       verdict: "DENY",
       rules: ["filesystem.backup-delete-unverified"],
@@ -2319,9 +2389,15 @@ async function classifyBackupPolicy(
     }
   }
 
-  for (const target of backupTargets) {
+  let siblingVerified = false
+  let verifiedAny = false
+  for (const target of [...identityBackupTargets, ...obviousBackupTargets]) {
     const inspected = await inspectBackupDeletionTarget(target, input)
     if (!inspected.allowed) {
+      // A failed obvious-only target must not become a new static DENY: without
+      // the exact-suffix anchor its verification is heuristic, so fall through
+      // to the general pipeline (ASK → dynamic review) as before.
+      if (identityBackupTargets.length === 0) return undefined
       return {
         verdict: "DENY",
         rules: ["filesystem.backup-delete"],
@@ -2329,7 +2405,10 @@ async function classifyBackupPolicy(
         fingerprints: [],
       }
     }
+    verifiedAny = true
+    if (inspected.sibling) siblingVerified = true
   }
+  if (!verifiedAny) return undefined
   if (input.strictness === "HARD") {
     return {
       verdict: "DENY",
@@ -2341,7 +2420,9 @@ async function classifyBackupPolicy(
   return {
     verdict: "ALLOW",
     rules: ["filesystem.backup-delete"],
-    reason: "Every backup has an exact original and is older than two minutes",
+    reason: siblingVerified
+      ? "Every backup is an obvious backup file with a similarly named sibling"
+      : "Every backup has an exact original and is older than two minutes",
     fingerprints: [],
   }
 }

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1-v2 (2026-09-03)
+
+### Changed
+- **LOOSE backup-deletion relaxation (static)**: a backup file may now be deleted
+  in LOOSE mode whenever it is obviously a backup — its name contains a complete
+  separator-delimited backup word (`bak`, `backup`, `old`, `orig`; a substring
+  inside a larger word like `bakery` does not count) and the same directory holds
+  a similarly named file (the original or another dated copy). This replaces the
+  exact-suffix-only rule (`.bak`/`.backup` with exact original, same kind, older
+  than two minutes) for LOOSE; dated and prefixed backup names
+  (`db-backup-20260813.sql`, `backup-config.json`) are now statically ALLOWed
+  instead of falling to the dynamic reviewer. Credential/private-key backups
+  (`.env.bak`, `id_rsa.backup`) remain DENY. HARD mode is unchanged.
+- **Dynamic reviewer LOOSE prompt** updated to mirror the same rule, and
+  `PROMPT_VERSION` bumped v3 → v4 to invalidate cached verdicts.
+
 ## 0.7.0-v2 (2026-09-01)
 
 User-configured bypass escape hatches to cut false positives and over-caution, plus
