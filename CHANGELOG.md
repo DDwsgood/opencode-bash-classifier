@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2-v2 (2026-09-05)
+
+- Build dynamic policy from enabled categories; remove bypassed prohibitions and emphasize trusted BYPASS PERMISSION at both ends of the system prompt. Preserve the unconditional safety floor.
+- Distinguish normal API/SSH authentication and probe data from credential theft; LOOSE no longer treats missing script evidence as sufficient grounds for rejection. Re-evaluate previous rejections against current permissions.
+- Exempt deletion-directory mandatory inspection under HARD filesystem bypass, while retaining executed-script inspection and independent reviewer tool-access limits. Bump verdict cache prompt version to v5.
+- Fix findings F1–F3: literal short sleep uses static ALLOW plus the existing duration guard; bounded worktree file globs for a small read-only command set use concrete-path checks; simple backticks share recursive read-only substitution review with $(). Keep dynamic/ambiguous substitutions, sensitive paths and symlink escapes conservative.
+- Add Bun static/security regressions and Python policy-combination/inspection regressions.
+
 ## 0.7.1-v2 (2026-09-03)
 
 ### Changed

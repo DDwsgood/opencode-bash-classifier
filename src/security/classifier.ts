@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import type { Dirent } from "node:fs"
-import { lstat, readFile, readdir, realpath, stat } from "node:fs/promises"
+import { lstat, opendir, readFile, readdir, realpath, stat } from "node:fs/promises"
 import path from "node:path"
 import type { BypassCategory } from "../config"
 import { ruleBypassed } from "./bypass"
@@ -907,53 +907,70 @@ function safeChmodSegment(segment: string, cwd: string, worktree: string): boole
   })
 }
 
-function commandSubstitutionBodies(text: string): string[] {
-  const bodies: string[] = []
-  let i = 0
-  while (i < text.length) {
-    const start = text.indexOf("$(", i)
-    if (start === -1) break
-    let depth = 1
-    let j = start + 2
-    while (j < text.length && depth > 0) {
-      if (text[j] === "(") depth += 1
-      else if (text[j] === ")") depth -= 1
-      if (depth > 0) j += 1
+// Locate simple shell substitutions without treating single-quoted examples as
+// execution. Escaped/nested legacy backticks stay conservative rather than
+// guessing their special quote-removal semantics.
+function substitutionSpans(text: string): Array<{ start: number; end: number; body: string }> {
+  const spans: Array<{ start: number; end: number; body: string }> = []
+  let quote = ""
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (quote === "'") { if (c === "'") quote = ""; continue }
+    if (c === "\\") { i++; continue }
+    if (c === "'" && !quote) { quote = c; continue }
+    if (c === '"') { quote = quote === '"' ? "" : '"'; continue }
+    if (c === "`") {
+      const end = text.indexOf("`", i + 1)
+      if (end < 0) return []
+      const body = text.slice(i + 1, end)
+      if (body.includes("\\")) return []
+      spans.push({ start: i, end: end + 1, body }); i = end
+    } else if (c === "$" && text[i + 1] === "(" && text[i + 2] !== "(") {
+      let depth = 1, innerQuote = "", j = i + 2
+      for (; j < text.length; j++) {
+        const ch = text[j]
+        if (innerQuote === "'") { if (ch === "'") innerQuote = ""; continue }
+        if (ch === "\\") { j++; continue }
+        if (ch === "'" && !innerQuote) { innerQuote = ch; continue }
+        if (ch === '"') { innerQuote = innerQuote === '"' ? "" : '"'; continue }
+        if (innerQuote) continue
+        if (ch === "(") depth++
+        if (ch === ")" && --depth === 0) break
+      }
+      if (depth !== 0) return []
+      spans.push({ start: i, end: j + 1, body: text.slice(i + 2, j) }); i = j
     }
-    bodies.push(text.slice(start + 2, j))
-    i = j + 1
   }
-  return bodies
+  return spans
+}
+
+function commandSubstitutionBodies(text: string): string[] {
+  return substitutionSpans(text).map((span) => span.body)
 }
 
 function maskCommandSubstitutions(text: string): string {
-  let out = ""
-  let i = 0
-  while (i < text.length) {
-    const start = text.indexOf("$(", i)
-    if (start === -1) {
-      out += text.slice(i)
-      break
-    }
-    out += text.slice(i, start) + "x"
-    let depth = 1
-    let j = start + 2
-    while (j < text.length && depth > 0) {
-      if (text[j] === "(") depth += 1
-      else if (text[j] === ")") depth -= 1
-      if (depth > 0) j += 1
-    }
-    i = j + 1
+  let out = "", end = 0
+  for (const span of substitutionSpans(text)) {
+    out += text.slice(end, span.start) + "x"
+    end = span.end
   }
-  return out
+  return out + text.slice(end)
 }
 
 function isSafeSubstitutionSurface(text: string, shell: string, ctx: PathContext, depth = 0): boolean {
   if (depth > 6) return false
+  if (shellEscapeCharacter(shell) === "`" && text.includes("`")) return false
   const subs = commandSubstitutionBodies(text)
   const masked = maskCommandSubstitutions(text)
   const stripped = stripOutputRedirects(masked) ?? masked
-  if (!isKnownSafeSegment(stripped)) return false
+  if (analyzeSegmentPaths(masked, ctx).kind !== "pass") return false
+  // Substitution output is unknown: do not feed it to a file-reading command.
+  if (subs.length && !/^(?:echo|printf|ls)\b/.test(masked.trim())) return false
+  const pieces = splitSimpleSegments(stripped, shell)
+  if (!pieces?.length || pieces.some((piece) =>
+    !/^(?:echo|printf|pwd|date|uname|hostname|whoami|ls|cat|head|tail|wc|grep|rg|basename|dirname)\b/.test(piece.trim()) ||
+    !isKnownSafeSegment(piece) || analyzeSegmentPaths(piece, ctx).kind !== "pass"
+  )) return false
   if (hasUnquotedExpansion(maskHeredocBody(stripped), shell)) return false
   if (hasSensitiveEnvPrefix(stripped)) return false
   if (analyzeSegmentPaths(stripped, ctx).kind !== "pass") return false
@@ -2928,6 +2945,8 @@ function isKnownSafeSegment(segment: string) {
     .replace(/(?:^|[\s;&|])\d*<[ \t]+[^\s<;&|()]+/g, "")
   if (/[<>](?![=])/.test(harmlessValue)) return false
   if (/^(?:true|false|:)\b/i.test(value)) return true
+  // Duration literals only; the slow-command layer enforces the time budget.
+  if (/^sleep\s+(?:\d+(?:\.\d+)?[smhd]?)(?:\s+\d+(?:\.\d+)?[smhd]?)*$/.test(value)) return true
 
   if (
     /^(?:echo|printf|Write-Output|ls|dir|pwd|whoami|date|uname|hostname|df|du|free|ps|stat|file|head|tail|wc|sort|uniq|which|where|whereis|Get-ChildItem|Get-Location|Get-Content|Select-String|Test-Path|Resolve-Path)\b/i.test(
@@ -3804,6 +3823,49 @@ async function recycleTargetsFinding(
   return undefined
 }
 
+async function expandSafeReadGlobs(segment: string, input: InternalClassifyInput): Promise<string | undefined> {
+  if (input.cwdUnknown || shellEscapeCharacter(input.shell) === "`") return undefined
+  if (!/^(?:grep|rg|cat|head|tail|wc|ls)\s/.test(segment)) return undefined
+  if (/["'`$\\;|&<>(){}\[\]\n]/.test(segment)) return undefined
+  const tokens = segment.trim().split(/\s+/)
+  const ctx: PathContext = { cwd: input.cwd, worktree: input.worktree, strictness: input.strictness ?? "LOOSE" }
+  // Do not broaden command options (rg --pre can execute a program).
+  const flags = /^(?:--|-[rnHhilcvswExq]+|-\d+|--line-number|--count|--files-with-matches)$/
+  if (tokens.slice(1).some((token) => token.startsWith("-") && !flags.test(token))) return undefined
+  if (!tokens.some((token) => /[*?]/.test(token))) return undefined
+  const out: string[] = []
+  let matchCount = 0
+  for (const token of tokens) {
+    if (!/[*?]/.test(token)) { out.push(token); continue }
+    // A literal directory prefix avoids option injection from bare globs.
+    if (!token.includes("/") || token.split("/").includes("..")) return undefined
+    const dir = path.resolve(input.cwd, path.dirname(token))
+    if (/[*?]/.test(dir) || !isWithin(input.worktree, dir)) return undefined
+    try {
+      if (await realpath(dir) !== dir) return undefined
+      const pattern = path.basename(token)
+      const regex = new RegExp("^" + [...pattern].map((ch) => ch === "*" ? ".*" : ch === "?" ? "." : ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("") + "$")
+      const matches: string[] = []
+      const handle = await opendir(dir)
+      let seen = 0
+      for await (const entry of handle) {
+        if (++seen > MAX_DIRECTORY_ENTRIES) return undefined
+        if (entry.name.startsWith(".") && !pattern.startsWith(".")) continue
+        if (!regex.test(entry.name)) continue
+        const absolute = path.join(dir, entry.name)
+        if (!entry.isFile() || !/^[\w./-]+$/.test(absolute)) return undefined
+        if (checkPathSensitivity(absolute, ctx).sensitive) return undefined
+        if (classifyPathTarget(absolute, "read", ctx).kind !== "pass") return undefined
+        if (++matchCount > MAX_REFERENCED_PATHS) return undefined
+        matches.push(absolute)
+      }
+      if (!matches.length) return undefined
+      out.push(...matches.sort())
+    } catch { return undefined }
+  }
+  return out.join(" ")
+}
+
 async function classifySegment(
   segment: string,
   base: string,
@@ -4070,6 +4132,9 @@ async function classifySegment(
       return { verdict: "DENY", rules: [rule.id], reason: rule.reason }
     }
   }
+
+  const expandedRead = await expandSafeReadGlobs(segment, segInput)
+  if (expandedRead) return classifySegment(expandedRead, base, segInput)
 
   if (provablySafe) {
     const finding = analyzeSegmentPaths(segment, { cwd: base, worktree: input.worktree, strictness })
