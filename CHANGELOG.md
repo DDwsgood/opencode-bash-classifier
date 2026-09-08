@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.3-v2 (2026-09-08)
+
+- Remove the unfinished `hardTimeoutMs` foreground/background timeout mechanism: delete the config option, resolution, and `applyPostChecks` injection. OpenCode's shell tool already applies a 120s foreground default timeout.
+- Fix slow-command false positives: expensive home/system roots are now exact-root matches, so scoped directories such as `~/.cache/opencode` and `/proc/self` are no longer flagged.
+- Raise the default `slowCommands.maxDepth` threshold from 3 to 16 so explicit bounded `find -maxdepth 4` scans are allowed.
+- Fix `findRoots()` so `find -maxdepth 4 /path` and other path-option-before-root forms are parsed correctly instead of being missed.
+- Update slow-command block hint to describe the actual bound requirement.
+
 ## 0.7.2-v2 (2026-09-05)
 
 - Build dynamic policy from enabled categories; remove bypassed prohibitions and emphasize trusted BYPASS PERMISSION at both ends of the system prompt. Preserve the unconditional safety floor.

@@ -58,7 +58,6 @@ export type SlowCommandsOptions = {
 export type BashClassifierOptions = {
   shell?: string
   securityEnabled?: boolean
-  hardTimeoutMs?: number
   detachedStartIsolation?: boolean
   supervisorEnabled?: boolean
   supervisorPath?: string
@@ -110,7 +109,6 @@ export type ResolvedSlowCommands = {
 export type ResolvedPluginConfig = {
   shell?: string
   securityEnabled: boolean
-  hardTimeoutMs: number
   detachedStartIsolation: boolean
   supervisorEnabled: boolean
   supervisorPath: string
@@ -130,7 +128,6 @@ export type ResolvedPluginConfig = {
 const ALLOWED_TOP_LEVEL = new Set([
   "shell",
   "securityEnabled",
-  "hardTimeoutMs",
   "detachedStartIsolation",
   "supervisorEnabled",
   "supervisorPath",
@@ -159,7 +156,6 @@ const ALLOWED_DYNAMIC_FIELDS = new Set([
   "auditorPath",
 ])
 
-const DEFAULT_HARD_TIMEOUT_MS = 120_000
 const DEFAULT_TIMEOUT_MS = 30_000
 const MIN_TIMEOUT_MS = 1
 const MAX_TIMEOUT_MS = 120_000
@@ -481,18 +477,6 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
     securityEnabled = source.securityEnabled
   }
 
-  let hardTimeoutMs = DEFAULT_HARD_TIMEOUT_MS
-  if (source.hardTimeoutMs !== undefined) {
-    if (
-      typeof source.hardTimeoutMs !== "number" ||
-      !Number.isFinite(source.hardTimeoutMs) ||
-      source.hardTimeoutMs < 0
-    ) {
-      throw new Error("hardTimeoutMs must be a non-negative finite number")
-    }
-    hardTimeoutMs = source.hardTimeoutMs
-  }
-
   let detachedStartIsolation = true
   if (source.detachedStartIsolation !== undefined) {
     if (typeof source.detachedStartIsolation !== "boolean") {
@@ -503,11 +487,11 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
 
   let slowCommands: ResolvedSlowCommands
   if (source.slowCommands === undefined) {
-    slowCommands = { enabled: true, maxDepth: 3, sleepThresholdSeconds: 120, allowExplicitTimeout: true }
+    slowCommands = { enabled: true, maxDepth: 16, sleepThresholdSeconds: 120, allowExplicitTimeout: true }
   } else if (typeof source.slowCommands === "boolean") {
     slowCommands = {
       enabled: source.slowCommands,
-      maxDepth: 3,
+      maxDepth: 16,
       sleepThresholdSeconds: 120,
       allowExplicitTimeout: true,
     }
@@ -517,7 +501,7 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
       if (!ALLOWED_SLOW_FIELDS.has(key)) throw new Error(`unknown slowCommands option: ${key}`)
     }
     const enabled = raw.enabled === undefined ? true : raw.enabled
-    const maxDepth = raw.maxDepth === undefined ? 3 : raw.maxDepth
+    const maxDepth = raw.maxDepth === undefined ? 16 : raw.maxDepth
     const sleepThresholdSeconds = raw.sleepThresholdSeconds === undefined ? 120 : raw.sleepThresholdSeconds
     const allowExplicitTimeout = raw.allowExplicitTimeout === undefined ? true : raw.allowExplicitTimeout
     if (typeof enabled !== "boolean") throw new Error("slowCommands.enabled must be a boolean")
@@ -610,7 +594,6 @@ export function resolvePluginConfig(raw?: BashClassifierOptions): ResolvedPlugin
   return {
     shell,
     securityEnabled,
-    hardTimeoutMs,
     detachedStartIsolation,
     supervisorEnabled,
     supervisorPath,

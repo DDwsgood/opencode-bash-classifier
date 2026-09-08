@@ -13,7 +13,7 @@ export type SlowCommandFinding = {
 
 // Short English hints
 const OPTIMIZE_HINT =
-  "High-cost unbound command, please narrow scope or add explicit timeout. If necessary, retry with longer timeout"
+  "High-cost scan without maxdepth or explicit timeout; narrow scope or set explicit timeout"
 
 const NEVER_EXITS_HINT = "Command never exits, use explicit timeout or background:true"
 const SLEEP_HINT = "Sleep too long, use shorter wait or readiness check with explicit timeout"
@@ -38,6 +38,28 @@ const HOME_CACHE_DIRS = new Set([
   ".pixi",
   ".yarn",
   ".pnpm-store",
+])
+
+// System/mount trees where only the root itself is expensive. A specific
+// subdirectory (e.g. /usr/share/doc or /proc/self) is bounded and must not be
+// flagged as an unbounded scan.
+const EXPENSIVE_SYSTEM_ROOTS = new Set([
+  "/",
+  "/mnt",
+  "/media",
+  "/proc",
+  "/sys",
+  "/dev",
+  "/usr",
+  "/var",
+  "/opt",
+  "/srv",
+  "/boot",
+  "/root",
+  "/etc",
+  "/run",
+  "/home",
+  "/users",
 ])
 
 // Commands that can cause unbounded scans
@@ -96,20 +118,19 @@ function isExpensiveRoot(rawRoot: string, cwd: string, worktree: string): boolea
   if (lower === "/tmp" || lower === "/var/tmp") return true
   if (lower.startsWith("/tmp/") || lower.startsWith("/var/tmp/")) return false
 
-  // Root and system/mount trees
-  if (lower === "/") return true
-  if (/^\/(?:mnt|media)(?:\/|$)/.test(lower)) return true
-  if (/^\/(?:proc|sys|dev)(?:\/|$)/.test(lower)) return true
-  if (/^\/(?:usr|var|opt|srv|boot|root|etc|run)(?:\/|$)/.test(lower)) return true
-  if (lower === "/home" || lower === "/users" || /^\/(?:home|users)\/[^/]+\/?$/.test(lower)) return true
+  // Root and system/mount trees: only the roots themselves are expensive.
+  if (EXPENSIVE_SYSTEM_ROOTS.has(lower)) return true
+  if (/^\/(?:home|users)\/[^/]+\/?$/.test(lower)) return true
   const homeMatch = lower.match(/^\/(?:home|users)\/[^/]+\/(.+)$/)
   if (homeMatch) {
-    const next = (homeMatch[1] ?? "").split("/")[0] ?? ""
-    // Any hidden dir under home that is cache-like is expensive; also treat any ~/.* as potentially large
+    const rest = homeMatch[1] ?? ""
+    const next = rest.split("/")[0] ?? ""
+    // Only the known cache-like hidden directories themselves are expensive
+    // (e.g. ~/.cache, ~/.local, ~/.npm). Specific subdirectories such as
+    // ~/.cache/opencode or ~/.local/share/opencode are bounded and must not be
+    // flagged.
     if (next.startsWith(".")) {
-      if (HOME_CACHE_DIRS.has(next)) return true
-      // For unknown hidden dirs, treat as expensive only if it's a direct child of home and hidden (conservative)
-      // To avoid FP for ~/.config etc, we only mark known caches; unknown hidden dirs in deep project paths are already exempt via worktree check
+      if (HOME_CACHE_DIRS.has(next) && rest === next) return true
       return false
     }
   }
@@ -204,11 +225,28 @@ function positionalsFor(words: string[], leaf: string): string[] {
   return out
 }
 
-// For find, roots are leading path args before expression flags
+// find options that take a value and may appear before the first path.
+const FIND_PATH_OPTIONS_WITH_VALUE = new Set(["-maxdepth", "--max-depth", "-mindepth", "-regextype", "--regextype"])
+// find global options that take no value and may appear before the first path.
+const FIND_GLOBAL_OPTIONS = new Set([
+  "-l",
+  "-h",
+  "-p",
+  "-xdev",
+  "-mount",
+  "--xdev",
+  "-ignore_readdir_race",
+  "-noignore_readdir_race",
+  "-noleaf",
+  "-daystart",
+  "-warn",
+  "-nowarn",
+])
+
+// For find, roots are the path args; expression predicates end the path list,
+// but global/path options before the first path must not.
 function findRoots(words: string[]): string[] {
   const roots: string[] = []
-  // Find's path args are before first expression flag starting with -, (, !, etc.
-  // But words already stripped of assignment prefixes, so words[0] is leaf
   for (let i = 1; i < words.length; i++) {
     const tok = words[i] ?? ""
     if (tok === "--") {
@@ -216,12 +254,19 @@ function findRoots(words: string[]): string[] {
       break
     }
     if (tok.startsWith("-")) {
-      // Check if it's -maxdepth etc which is not expression but option; still treat as flag, not root
-      // Expression flags start after paths, so we should stop collecting roots at first such flag that is not a path option?
-      // For find, -maxdepth is also a path option but counts as flag; we still stop root collection when we see a flag that is not a path-like?
-      // Simpler: roots are only initial positionals before any flag; but -maxdepth etc are flags, so we need to know where paths end.
-      // We can treat any flag as end of roots, except we already handle -maxdepth via flagValue; roots before that are paths.
-      // So break at first flag
+      const lower = tok.toLowerCase()
+      if (FIND_PATH_OPTIONS_WITH_VALUE.has(lower)) {
+        i++ // skip value
+        continue
+      }
+      if (
+        FIND_GLOBAL_OPTIONS.has(lower) ||
+        lower.startsWith("--max-depth=") ||
+        lower.startsWith("-maxdepth=") ||
+        lower.startsWith("-mindepth=")
+      ) {
+        continue
+      }
       break
     }
     if (tok === "(" || tok === ")" || tok === "!" || tok === ",") break
@@ -250,14 +295,8 @@ function scanFinding(leaf: string, words: string[], ctx: { cwd: string; worktree
   let roots: string[] = []
   if (leaf === "find") {
     roots = findRoots(words)
-    // Fallback: if findRoots empty due to no explicit path, use "."? But "." is worktree-relative, not expensive
-    if (roots.length === 0) {
-      // Check if next tokens include paths via positionals fallback
-      const pos = positionalsFor(words, leaf)
-      // pos includes things like -maxdepth values incorrectly, but we already handled
-      // For find, if no roots, it's implicit "." -> not expensive
-      roots = []
-    }
+    // If no explicit roots remain (e.g. bare `find`), the implicit root is
+    // "." — worktree-relative and not expensive, so no flag below.
   } else if (leaf === "grep" || leaf === "rg") {
     const pos = positionalsFor(words, leaf)
     // First positional is pattern, rest are roots

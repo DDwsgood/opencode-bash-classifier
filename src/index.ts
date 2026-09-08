@@ -52,7 +52,6 @@ import { resolveClassifierShell } from "./shell-dialect"
 import { BYPASS_CATEGORIES, resolvePluginConfig, type BashClassifierOptions, type BypassCategory } from "./config"
 import {
   classifyShellCommand,
-  isDownloadOrBuildCommand,
   isolateDetachedStartCommand,
   verifyScriptFingerprints,
   type StaticSecurityDecision,
@@ -919,16 +918,6 @@ const plugin: Plugin = {
       decision: StaticSecurityDecision,
       shell: string,
     ) {
-      // M15: v2 background runs have no default timeout, so hardTimeoutMs must not
-      // be injected for them (it would force-kill long-running background work).
-      if (resolved.hardTimeoutMs > 0 && !isDownloadOrBuildCommand(script) && input.background !== true) {
-        const original = input.timeout
-        const hasExplicit = typeof original === "number" && Number.isFinite(original) && original > 0
-        if (!hasExplicit) {
-          input.timeout = resolved.hardTimeoutMs
-        }
-      }
-
       if (resolved.detachedStartIsolation && !supervisorActive) {
         const isolated = isolateDetachedStartCommand(script, shell)
         if (isolated !== script) {

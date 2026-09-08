@@ -191,7 +191,7 @@ const temporaryBypass = new Map<string /* sessionID */, {
 
 （`network.reverse-shell` 建议也进底线——它超出"信任 HTTP 地址"的范畴、属于远程控制原语；待用户确认，默认建议保留拦截。）
 
-保留项（与安全类别无关，永不受 bypass 影响）：慢命令软拦截（性能成本）、`hardTimeoutMs` 注入、`apply_patch` 删文件块（工具路由约束）、`input.empty`。**OpenCode 原生权限层不受本插件 bypass 影响**，仍是最终关卡——这是良好的纵深防御残余。
+保留项（与安全类别无关，永不受 bypass 影响）：慢命令软拦截（性能成本）、`apply_patch` 删文件块（工具路由约束）、`input.empty`。**OpenCode 原生权限层不受本插件 bypass 影响**，仍是最终关卡——这是良好的纵深防御残余。
 
 ### 7.2 `dynamic` 类别
 

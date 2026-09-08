@@ -136,9 +136,8 @@ shell 请求
 | `dynamicReview.allowFullReadAccess` | boolean | `false` | 允许审查器只读工具访问整个文件系统 |
 | `dynamicReview.pythonPath` | string | PATH 查找 | Python 解释器 |
 | `dynamicReview.auditorPath` | string | 内置 `auditor.py` | 审查脚本路径 |
-| `hardTimeoutMs` | number | `120000` | 无显式 timeout 的非下载/构建命令默认超时；`0` 关闭 |
 | `detachedStartIsolation` | boolean | `true` | supervisor 未激活时对 `start`/`Start-Process` 追加句柄隔离 |
-| `slowCommands` | boolean | `true` | 拦截安全但必耗时的命令（系统/挂载树的无界扫描、`-f` 流式、超长 `sleep`），除非调用方显式给了 timeout。底层默认参数：`maxDepth=3`（find/rg/fd 的 `-maxdepth` 阈值）、`sleepThresholdSeconds=120`（sleep 阻断阈值，`>=` 即拦）、`allowExplicitTimeout=true`（调用方传入工具参数 timeout 时不拦） |
+| `slowCommands` | boolean | `true` | 拦截安全但必耗时的命令（系统/挂载树的无界扫描、`-f` 流式、超长 `sleep`），除非调用方显式给了 timeout。底层默认参数：`maxDepth=16`（find/rg/fd 的 `-maxdepth` 阈值，超过才拦）、`sleepThresholdSeconds=120`（sleep 阻断阈值，`>=` 即拦）、`allowExplicitTimeout=true`（调用方传入工具参数 timeout 时不拦） |
 | `logReviewerTrace` | boolean | `false` | 审计轨迹开关。为真时每次动态审查（判决或错误）及每次动态缓存命中（allow/deny）向 `~/.opencode/reviewer-trace.jsonl` 追加一行 JSONL（含时间戳、命令、endpoint/model、判决/原因/错误）；写入失败静默忽略，不影响审查流程 |
 | `supervisorEnabled` | boolean | Windows 下 `true` | 使用原生 shell supervisor |
 | `supervisorPath` | string | 包内默认 | supervisor `bash.exe` 路径 |
