@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.2-v2 (2026-09-10)
+
+- Deliver the agent bypass reminder as an **appended user message** instead of a system-prompt
+  part. `session.synthetic` (`resume:false`) lowers to `role: "user"` in the request
+  (`runner/to-llm-message.ts`), so appending it at the end of history keeps the cached prefix
+  intact — a `system` part sits near the front and invalidates the message cache. A user message is
+  also more salient to the agent.
+- Send reminders only on state transitions (arm/change/end), not every step, so they no longer
+  grow the request each turn. They carry no `description`, so the user's chat transcript is
+  unaffected (the user is notified separately over RPC).
+- Track the last announced category set per session so expiry is detected correctly. The previous
+  expiry check recomputed the set after the lease had already expired and so never announced the
+  end; subagents created under an active bypass now also receive one reminder.
+
 ## 0.8.1-v2 (2026-09-10)
 
 - Fix the TUI companion silently dropping every notification after the user switches to a session in

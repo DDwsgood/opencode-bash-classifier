@@ -1,5 +1,11 @@
 # /bypass-classifier 通知机制与提示词改进设计
 
+> **实现状态注记（2026-09-10，定稿）**：agent 侧最终**未采用** §4.2 的 `session.hook("context")`
+> system 注入——追加 system 会改动前端提示词、使消息缓存整体失效。实现改为 `session.synthetic`
+> （`resume:false`）**追加一条 user 消息**（runner 将 synthetic 降为 `role:"user"`），在历史末尾
+> 追加、保留已缓存前缀，且仅在状态跳变（arm/变更/结束）时发送、非每步。用户侧仍为 event-only RPC
+> + TUI toast（§4.1）。以 `src/index.ts`、`src/tui.ts`、`src/bypass-rpc.ts`、README 为准。
+
 > 状态：**调研/设计稿，未改代码**。既有文件只读。
 > 证据均来自本仓库 `src/` 与 `opencode-v2-src-latest`（branch v2）源码，引用格式 `文件:行`。
 > 日期：2026-09-10。

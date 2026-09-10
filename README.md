@@ -79,8 +79,9 @@
 
 v2 不存在“用户可见但模型不可见”的会话消息类型：`synthetic`/`system`/`shell` 都会进入模型上下文，且无 `description` 的 `synthetic` 在 TUI 聊天里还会被过滤掉。因此状态反馈分两条通道，互不共用：
 
-- **agent 侧**：通过 `session.hook("context")` 注入 `<system_reminder>`。豁免活动期间每一步都注入一条简短警告（提醒这是临时放宽、不是破坏性操作的授权）；到期时注入**一次性**“已失效”提示（由定时 sweep 触发，否则惰性过期不会产生跳变事件）。注入不会唤醒会话。
+- **agent 侧**：以 `session.synthetic`（`resume:false`）**追加一条 user 消息**注入 `<system_reminder>`。runner 会把 synthetic 降级为 `role: "user"`（`runner/to-llm-message.ts`）——追加在历史末尾，**保留已缓存前缀**（不像 system 提示词那样位于前端、会让消息缓存整体失效），且 user 消息比系统提示更醒目。仅在**状态跳变**时发送（arm/变更/结束，由 20s sweep 触发到期），不是每步注入；不带 `description`，因此不占用用户聊天记录。仅在下一次请求才可见——不会主动唤醒会话。
 - **用户侧**：服务端注册 event-only RPC（`src/bypass-rpc.ts`），由本包的 TUI 伴随入口（`src/tui.ts`，package `exports["./tui"]`）订阅并弹 toast 显示 armed/updated/cleared/expired/status。参数非法时命令抛错，TUI 显示 usage；usage 不再回显给 agent。
+- “是否变化”以**已告知 agent 的集合**为准（而非当前 `activeBypass`）：sweep 运行时租约已过期，若按当前集合重算会得出“无变化”而漏报到期的结束提示。
 - 无 TUI 伴随（旧 host 无 RPC 域或未加载 CLI 插件）时静默降级：agent 警告仍生效，用户 toast 不可用。
 - **本地目录安装**：host 对“目录”形式的插件目标只解析 `<dir>/index`（server）与 `<dir>/tui`（TUI），不看 package.json exports；因此仓库根有 `index.ts` / `tui.ts` 两个薄转发文件。npm 包则走 `exports`。
 
