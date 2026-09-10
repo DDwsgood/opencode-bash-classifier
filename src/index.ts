@@ -45,10 +45,11 @@ import { access, appendFile, mkdir, readFile, realpath } from "node:fs/promises"
 import { homedir, release as osRelease } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { Effect, Stream } from "effect"
+import { Effect, Schedule, Stream } from "effect"
 import type { Plugin } from "@opencode-ai/plugin/effect/plugin"
 import type { Scope } from "effect"
 import { resolveClassifierShell } from "./shell-dialect"
+import { BypassRpc } from "./bypass-rpc"
 import { BYPASS_CATEGORIES, resolvePluginConfig, type BashClassifierOptions, type BypassCategory } from "./config"
 import {
   classifyShellCommand,
@@ -441,11 +442,39 @@ interface EffectPluginContext {
     readonly synthetic: (input: {
       sessionID: string
       text: string
+      /** Shown as the transcript row; without it the TUI hides the message. */
+      description?: string
       metadata?: Record<string, unknown>
       resume?: boolean
     }) => Effect.Effect<unknown, unknown>
+    readonly hook: (
+      name: "context",
+      callback: (event: SessionContextEvent) => Effect.Effect<void, never>,
+    ) => Effect.Effect<unknown, never, Scope.Scope>
+  }
+  // Event-only RPC used to push bypass state changes to the TUI companion.
+  // See src/bypass-rpc.ts for why a session message cannot carry this.
+  // Optional so the plugin still loads on hosts that predate the RPC domain;
+  // user toasts are then simply unavailable.
+  readonly rpc?: {
+    readonly register: (
+      definition: unknown,
+      handlers: Record<string, unknown>,
+    ) => Effect.Effect<
+      { readonly events: { readonly emit: (...args: unknown[]) => Effect.Effect<void, unknown> } },
+      unknown,
+      Scope.Scope
+    >
   }
   readonly event: { readonly subscribe: () => Stream.Stream<unknown> }
+}
+
+// Subset of the v2 `session.hook("context")` event this plugin touches:
+// packages/plugin/src/effect/session.ts (SessionContext) and
+// packages/ai/src/schema/messages.ts (SystemPart = { type: "text", text }).
+type SessionContextEvent = {
+  readonly sessionID: string
+  system: Array<{ type: "text"; text: string }>
 }
 
 // v2 ctx.command.transform draft (packages/plugin/src/effect/command.ts).
@@ -567,6 +596,31 @@ const plugin: Plugin = {
     // child → parent links (session lifetime, NOT lease lifetime): written on
     // session.created, cleared on session.deleted only.
     const bypassParent = new Map<string, string>()
+    // One-time agent notices, drained by the session context hook. Expiry is
+    // the event that needs a one-shot reminder: while a lease is live the
+    // context hook injects a persistent reminder on every model step.
+    const bypassNotices = new Map<string, string[]>()
+    // Assigned once the RPC in section 8b is registered.
+    let bypassRpc:
+      | { readonly events: { readonly emit: (...args: unknown[]) => Effect.Effect<void, unknown> } }
+      | undefined
+
+    // Agent-facing reminders. The active reminder is deliberately short: it is
+    // re-injected every model step while a bypass is live, so long prose would
+    // cost tokens on every request. Expiry is one-shot.
+    const BYPASS_ACTIVE_REMINDER = (categories: string[]) =>
+      [
+        "<system_reminder>",
+        `Classifier bypass is ACTIVE for this session: ${categories.join(", ")}. Some checks are relaxed;`,
+        "this is a temporary convenience, NOT authorization for destructive, irreversible,",
+        "credential-related, or system-level actions. It expires on its own.",
+        "</system_reminder>",
+      ].join("\n")
+    const BYPASS_EXPIRED_REMINDER = [
+      "<system_reminder>",
+      "Classifier bypass ENDED for this session; normal static and dynamic checks are active again.",
+      "</system_reminder>",
+    ].join("\n")
 
     /** Ancestors of a session (nearest first), bounded by cycle guard. */
     function bypassAncestors(sessionID: string): string[] {
@@ -583,42 +637,60 @@ const plugin: Plugin = {
 
     /** Renew the session's own lease and every live ancestor lease: child
      * activity (a subagent doing the shell work) keeps the parent bypass the
-     * child inherits from expiring mid-work. */
+     * child inherits from expiring mid-work. Expired leases are ignored (the
+     * sweep owns removal + notification) so unrelated activity cannot revive a
+     * stale lease. */
     function renewBypassLease(sessionID: string) {
       const now = Date.now()
-      pruneExpiredBypassLeases(now)
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
-        if (lease) lease.expiresAt = now + resolved.bypassLeaseTtlMs
-      }
-    }
-
-    function pruneExpiredBypassLeases(now: number) {
-      // Expiry only drops the lease, never the parent link: a child whose own
-      // lease expired must still fall through to a still-active ancestor.
-      for (const [sessionID, lease] of bypassLeases) {
-        if (lease.expiresAt <= now) bypassLeases.delete(sessionID)
+        if (lease && lease.expiresAt > now) lease.expiresAt = now + resolved.bypassLeaseTtlMs
       }
     }
 
     /** Active bypass categories for a session: permanent config set ∪ the
      * union of every live lease along the ancestor chain (the session's own
-     * lease plus inherited parent leases). */
+     * lease plus inherited parent leases). Expired leases are skipped without
+     * mutating the map; the sweep removes them. */
     function activeBypass(sessionID: string): Set<BypassCategory> {
       const now = Date.now()
-      pruneExpiredBypassLeases(now)
       const active = new Set<BypassCategory>(resolved.bypassClassifier)
       for (const target of [sessionID, ...bypassAncestors(sessionID)]) {
         const lease = bypassLeases.get(target)
-        if (lease) for (const category of lease.categories) active.add(category)
+        if (lease && lease.expiresAt > now) for (const category of lease.categories) active.add(category)
       }
       return active
     }
 
-    function describeCategories(categories: Iterable<string>) {
-      const list = [...categories]
-      if (list.length === 0) return "none"
-      return list.sort().join(", ")
+    /** Push a bypass state change to the TUI companion (best effort). The TUI
+     * is the only user-visible channel that does not enter the model context. */
+    function emitBypassChanged(sessionID: string, reason: string) {
+      if (!bypassRpc) return
+      const permanent = [...resolved.bypassClassifier].sort()
+      const active = [...activeBypass(sessionID)].sort()
+      const temporary = active.filter((category) => !resolved.bypassClassifier.has(category))
+      void run(bypassRpc.events.emit("changed", { sessionID, reason, active, temporary, permanent })).catch(
+        () => {},
+      )
+    }
+
+    /** Remove leases whose TTL elapsed. When the session has no remaining
+     * bypass (permanent config or inherited leases), queue a one-shot agent
+     * reminder and notify the user that protection ended; otherwise the active
+     * set merely changed. Called on a timer because lease pruning is otherwise
+     * lazy, so the transition would never be observed. */
+    function sweepExpiredBypass() {
+      const now = Date.now()
+      for (const [sessionID, lease] of [...bypassLeases]) {
+        if (lease.expiresAt > now) continue
+        bypassLeases.delete(sessionID)
+        if (activeBypass(sessionID).size === 0) {
+          bypassNotices.set(sessionID, [BYPASS_EXPIRED_REMINDER])
+          emitBypassChanged(sessionID, "expired")
+        } else {
+          emitBypassChanged(sessionID, "updated")
+        }
+      }
     }
 
     function parseBypassArguments(text: string): { add: Set<BypassCategory>; clear: boolean; invalid: string[] } {
@@ -647,11 +719,18 @@ const plugin: Plugin = {
       return { add, clear, invalid }
     }
 
+    function bypassUsage(invalid: string[]): string {
+      return `Unknown bypass categor${invalid.length > 1 ? "ies" : "y"}: ${invalid.join(", ")}.\nUsage: /bypass-classifier <filesystem|os|secret|dynamic|web|all|off> — categories: space or comma separated.`
+    }
+
     function armBypassLease(sessionID: string, categories: Set<BypassCategory>) {
       bypassLeases.set(sessionID, {
         categories: new Set(categories),
         expiresAt: Date.now() + resolved.bypassLeaseTtlMs,
       })
+      // Drop any pending "bypass ended" reminder: re-arming supersedes it, and
+      // leaving it queued would inject a contradictory message on the next step.
+      bypassNotices.delete(sessionID)
       // Freshly armed session: prior rejection records would keep forcing
       // dynamic review (and HARD abort semantics) for a bypassed command.
       const state = sessions.get(sessionID)
@@ -814,13 +893,16 @@ const plugin: Plugin = {
         const anyCtx = ctx as unknown as { ui?: { toast?: { show?: (o: unknown) => void } } }
         anyCtx.ui?.toast?.show?.({ message: shortMsg, variant: "error", duration: 5000 })
       } catch {}
-      // Also send synthetic message to the session that triggered it, visible in TUI chat.
+      // Also surface to the user: a synthetic needs a `description` to render
+      // in the TUI chat. Without it the message would be hidden from the user
+      // while still entering the model context.
       // resume:false (M11) — a reviewer-outage notice must never auto-resume the session.
       try {
         await run(
           ctx.session.synthetic({
             sessionID,
             text: shortMsg,
+            description: shortMsg,
             metadata: { source: "bash-classifier-dynamic-review" },
             resume: false,
           }),
@@ -1252,6 +1334,7 @@ const plugin: Plugin = {
               ctx.session.synthetic({
                 sessionID,
                 text: "Prompt injection detected in command or review data; command denied and session interrupted.",
+                description: "Prompt injection detected; command denied and session interrupted.",
                 metadata: { source: "bash-classifier-injection-detector" },
                 resume: false,
               }),
@@ -1399,6 +1482,7 @@ const plugin: Plugin = {
                 deleteSessionState(sessionID)
                 bypassLeases.delete(sessionID)
                 bypassParent.delete(sessionID)
+                bypassNotices.delete(sessionID)
                 // Children still linking to the deleted parent would otherwise
                 // dangle forever; the map stays bounded to live sessions.
                 for (const [child, parent] of bypassParent) {
@@ -1427,65 +1511,89 @@ const plugin: Plugin = {
       )
       .pipe(Effect.forkScoped)
 
-    // --- 8. /bypass-classifier server command --------------------------------
+    // --- 8. agent-facing bypass reminders (session context hook) ------------
+    // v2 has no user-only session message: synthetic/system/shell all enter the
+    // model context, and a description-less synthetic is hidden from the TUI
+    // transcript entirely. The agent warning therefore goes through the context
+    // hook as a SystemPart (model-visible, never wakes the session), while user
+    // notifications go over the event-only RPC registered just below.
+    //
+    // The active warning is re-injected every step while a lease is live; the
+    // expiry warning is drained once from bypassNotices. Appending to the end of
+    // `system` preserves the cached static prefix.
+    //
+    // Known host limitation: SessionContext exposes no request `kind`, and the
+    // hook also fires for compaction/generate requests, so a pending one-shot
+    // notice can be consumed by an auxiliary request instead of the agent loop.
+    // Harmless (the notice is not security-critical) but not fixable plugin-side.
+    yield* ctx.session.hook("context", (event) =>
+      Effect.sync(() => {
+        const notices = bypassNotices.get(event.sessionID)
+        if (notices && notices.length > 0) {
+          bypassNotices.delete(event.sessionID)
+          for (const text of notices) event.system.push({ type: "text", text })
+        }
+        const active = [...activeBypass(event.sessionID)].sort()
+        if (active.length > 0) event.system.push({ type: "text", text: BYPASS_ACTIVE_REMINDER(active) })
+      }),
+    )
+
+    // --- 8b. bypass notification RPC (server → TUI companion) ---------------
+    // Event-only contract shared with src/tui.ts. Fire-and-forget: a missing or
+    // failed TUI subscriber must never affect command handling. Hosts without
+    // the RPC domain (older builds) simply skip user toasts.
+    if (ctx.rpc) bypassRpc = yield* ctx.rpc.register(BypassRpc, {})
+
+    // --- 8c. lease expiry sweep ---------------------------------------------
+    // Lease pruning is otherwise lazy (activeBypass merely skips expired
+    // entries), so without a timer the expiry transition — the one-shot agent
+    // reminder and the user notification — would never fire.
+    const BYPASS_SWEEP_INTERVAL_MS = 20_000
+    yield* Effect.sync(() => sweepExpiredBypass()).pipe(
+      Effect.repeat(Schedule.spaced(`${BYPASS_SWEEP_INTERVAL_MS} millis`)),
+      Effect.forkScoped,
+    )
+
+    // --- 8d. /bypass-classifier server command ------------------------------
     // Server-registered slash command: the TUI autocomplete lists it and
     // submission routes through client.api.session.command, so the arguments
     // never reach the model. State changes live only in this plugin process
-    // (see bypassLeases). Status/errors are reported with session.synthetic
-    // (resume:false) so the chat transcript carries the outcome.
+    // (see bypassLeases). Invalid input fails the command, which the TUI turns
+    // into an error toast carrying the usage; valid state changes are reported
+    // to the user through the RPC event above, never through a session message.
     yield* ctx.command.transform((draft) => {
       draft.add({
         name: "bypass-classifier",
         description:
           "Arm temporary classifier bypass categories for this session (filesystem|os|secret|dynamic|web, 'all', or 'off')",
         execute: (input) =>
-          Effect.tryPromise({
-            try: async () => {
-              const sessionID = input.sessionID
-              const permanent: ReadonlySet<string> = resolved.bypassClassifier
-              const args = parseBypassArguments(input.prompt?.text ?? "")
-              if (args.invalid.length > 0) {
-                await run(
-                  ctx.session.synthetic({
-                    sessionID,
-                    text: `Unknown bypass categor${args.invalid.length > 1 ? "ies" : "y"}: ${args.invalid.join(", ")}. Valid: filesystem, os, secret, dynamic, web, all, off.`,
-                    metadata: { source: "bash-classifier-bypass" },
-                    resume: false,
-                  }),
-                ).catch(() => {})
-                return
-              }
-              if (args.clear) {
-                bypassLeases.delete(sessionID)
-              }
-              if (args.add.size > 0) {
-                // Additive: start from the session's current active set (own
-                // lease plus inherited parents) so a second invocation keeps
-                // previously armed categories. `off` starts from scratch.
-                const next = args.clear ? new Set<BypassCategory>() : activeBypass(sessionID)
-                for (const category of args.add) next.add(category)
-                armBypassLease(sessionID, next)
-              }
-              const active = activeBypass(sessionID)
-              const temporary = [...active].filter((category) => !permanent.has(category))
-              const lease = bypassLeases.get(sessionID)
-              const lines = [
-                `BypassClassifier status for this session:`,
-                `  Active: ${describeCategories(active) || "none"}`,
-                `  Permanent (config.json): ${describeCategories(permanent) || "none"}`,
-                `  Temporary (this session, ${resolved.bypassPropagateToSubagents ? "inherited by subagents" : "not inherited"}): ${describeCategories(temporary) || "none"}${lease ? `, expires in ${Math.max(1, Math.round((lease.expiresAt - Date.now()) / 60000))} min of inactivity` : ""}`,
-                `Usage: /bypass-classifier <filesystem|os|secret|dynamic|web|all|off> — categories: space or comma separated.`,
-              ]
-              await run(
-                ctx.session.synthetic({
-                  sessionID,
-                  text: lines.join("\n"),
-                  metadata: { source: "bash-classifier-bypass" },
-                  resume: false,
-                }),
-              ).catch(() => {})
-            },
-            catch: () => Effect.void,
+          Effect.gen(function* () {
+            const sessionID = input.sessionID
+            const args = parseBypassArguments(input.prompt?.text ?? "")
+            if (args.invalid.length > 0) {
+              return yield* Effect.fail(new Error(bypassUsage(args.invalid)))
+            }
+            // Captured before any mutation so `armed` (first activation) is
+            // distinguished from `updated` (an already-active bypass changed).
+            const wasActive = activeBypass(sessionID).size > 0
+            let reason = "status"
+            if (args.clear) {
+              if (bypassLeases.delete(sessionID)) reason = "cleared"
+            }
+            if (args.add.size > 0) {
+              // Additive: start from the session's current active set (own
+              // lease plus inherited parents) so a second invocation keeps
+              // previously armed categories. `off` starts from scratch.
+              const next = args.clear ? new Set<BypassCategory>() : activeBypass(sessionID)
+              for (const category of args.add) next.add(category)
+              armBypassLease(sessionID, next)
+              reason = wasActive ? "updated" : "armed"
+            } else if (reason === "cleared" && activeBypass(sessionID).size === 0) {
+              // Clearing actually ended protection (no permanent categories
+              // remain): tell the agent on the next step, same as expiry.
+              bypassNotices.set(sessionID, [BYPASS_EXPIRED_REMINDER])
+            }
+            emitBypassChanged(sessionID, reason)
           }),
       })
     })
@@ -1501,6 +1609,8 @@ const plugin: Plugin = {
         sessionDirectories.clear()
         bypassLeases.clear()
         bypassParent.clear()
+        bypassNotices.clear()
+        bypassRpc = undefined
       }),
     )
   }),

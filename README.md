@@ -75,6 +75,15 @@
 - 多次 arm 叠加：`/bypass-classifier os` 后再 `/bypass-classifier web` = {os, web}；`off` 清空；`off os` 清空后只 arm os。
 - **子代理传导**（默认开，`bypassPropagateToSubagents: false` 关闭）：子代理会话继承父会话（沿祖先链并集）的 armed 类别；子代理干活会续期父会话租约。
 
+### 通知（agent 与用户分离）
+
+v2 不存在“用户可见但模型不可见”的会话消息类型：`synthetic`/`system`/`shell` 都会进入模型上下文，且无 `description` 的 `synthetic` 在 TUI 聊天里还会被过滤掉。因此状态反馈分两条通道，互不共用：
+
+- **agent 侧**：通过 `session.hook("context")` 注入 `<system_reminder>`。豁免活动期间每一步都注入一条简短警告（提醒这是临时放宽、不是破坏性操作的授权）；到期时注入**一次性**“已失效”提示（由定时 sweep 触发，否则惰性过期不会产生跳变事件）。注入不会唤醒会话。
+- **用户侧**：服务端注册 event-only RPC（`src/bypass-rpc.ts`），由本包的 TUI 伴随入口（`src/tui.ts`，package `exports["./tui"]`）订阅并弹 toast 显示 armed/updated/cleared/expired/status。参数非法时命令抛错，TUI 显示 usage；usage 不再回显给 agent。
+- 无 TUI 伴随（旧 host 无 RPC 域或未加载 CLI 插件）时静默降级：agent 警告仍生效，用户 toast 不可用。
+- **本地目录安装**：host 对“目录”形式的插件目标只解析 `<dir>/index`（server）与 `<dir>/tui`（TUI），不看 package.json exports；因此仓库根有 `index.ts` / `tui.ts` 两个薄转发文件。npm 包则走 `exports`。
+
 ### 类别语义
 
 | 类别 | 豁免内容 |

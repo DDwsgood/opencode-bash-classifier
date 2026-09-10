@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.0-v2 (2026-09-10)
+
+- Fix `/bypass-classifier` feedback channels. Previously state/usage was returned via
+  `session.synthetic` without a `description`, which made it **model-visible but hidden from the
+  TUI transcript** (v2 synthetic messages enter the model context; description-less ones are
+  filtered from chat rows).
+- Agent notification now goes through `session.hook("context")`: a short `<system_reminder>`
+  warning is re-injected on every step while a bypass is active, and a one-shot "bypass ended"
+  reminder fires on expiry. Neither wakes the session.
+- Added a lease-expiry sweep (20s) so the expiry transition is observed; lease pruning was
+  previously lazy and produced no notification.
+- User notification now goes through an event-only RPC (`src/bypass-rpc.ts`) consumed by an
+  optional TUI companion (`src/tui.ts`, package `exports["./tui"]`) that shows toasts. No sidebar.
+- `/bypass-classifier <invalid>` now fails the command (TUI shows the usage) instead of echoing
+  usage to the model. Removed all bypass-related session messages.
+- Also fix the same visibility defect in the two adjacent alerts: the dynamic-reviewer outage
+  notice and the prompt-injection alert now carry a `description`, so they render in the TUI chat
+  (they were previously model-only despite comments claiming TUI visibility).
+- State-machine hardening after review: re-arming clears a queued "bypass ended" notice; the
+  expiry sweep reports "ended" only when no permanent/inherited bypass remains; notices are
+  cleared on session deletion; `armed` vs `updated` now reflects prior state.
+
 ## 0.7.3-v2 (2026-09-08)
 
 - Remove the unfinished `hardTimeoutMs` foreground/background timeout mechanism: delete the config option, resolution, and `applyPostChecks` injection. OpenCode's shell tool already applies a 120s foreground default timeout.
