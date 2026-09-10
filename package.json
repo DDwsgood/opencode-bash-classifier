@@ -1,6 +1,6 @@
 {
   "name": "opencode-bash-classifier",
-  "version": "0.8.0-v2",
+  "version": "0.8.1-v2",
   "description": "Execution-boundary command safety classifier for OpenCode's shell tool (v2 plugin API port): static per-segment review plus a tool-enhanced OpenAI-compatible model reviewer.",
   "type": "module",
   "main": "./src/index.ts",

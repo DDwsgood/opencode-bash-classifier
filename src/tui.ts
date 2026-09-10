@@ -26,30 +26,26 @@ const plugin: Plugin.Definition = {
       }
     }
     if (!client?.rpc) return () => {}
-    const here = context.location as { directory?: string; workspaceID?: string } | undefined
     let unsubscribe: (() => void) | undefined
     try {
       unsubscribe = client.rpc(BypassRpc).events.on("changed", (event) => {
         try {
-          // A server host may hold several locations; only surface the one this
-          // TUI is attached to. Prefer a workspaceID match when both sides expose
-          // one, and fall back to directory equality otherwise. Skip only when no
-          // available identity matches, so a spelling mismatch does not silently
-          // suppress every notification.
+          // `context.location` is a live getter: read it here, not once at
+          // setup. Capturing it at setup froze the location the TUI happened to
+          // be on when the plugin loaded, so switching to a session in another
+          // directory silently dropped every toast (the original bug).
+          const here = context.location as { directory?: string; workspaceID?: string } | undefined
           const there = event.location as { directory?: string; workspaceID?: string } | undefined
-          if (here && there) {
-            const workspaceMatches =
-              here.workspaceID !== undefined &&
-              there.workspaceID !== undefined &&
-              here.workspaceID === there.workspaceID
-            const directoryMatches =
-              here.directory !== undefined && there.directory !== undefined && here.directory === there.directory
-            const known = here.workspaceID !== undefined || here.directory !== undefined
-            const comparable =
-              (here.workspaceID !== undefined && there.workspaceID !== undefined) ||
-              (here.directory !== undefined && there.directory !== undefined)
-            if (known && comparable && !workspaceMatches && !directoryMatches) return
-          }
+          // The server RPC event is not location-scoped, so a host with several
+          // locations would deliver all of them. Only filter when the reliable
+          // identity (workspaceID) is present on both sides and actually differs;
+          // never drop on a directory spelling/timing mismatch.
+          if (
+            here?.workspaceID !== undefined &&
+            there?.workspaceID !== undefined &&
+            here.workspaceID !== there.workspaceID
+          )
+            return
           context.ui.toast.show(toastFor(event.data as BypassChangedData))
         } catch (error) {
           console.error("[opencode-bash-classifier] bypass toast failed", error)

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.1-v2 (2026-09-10)
+
+- Fix the TUI companion silently dropping every notification after the user switches to a session in
+  a different directory. The companion captured `context.location` **once at setup** and compared it
+  against each event's location; the captured value froze the directory the TUI happened to be on
+  when the plugin loaded. It now reads the live `context.location` getter per event and only filters
+  on a definite `workspaceID` mismatch, never on a directory spelling/timing difference.
+
 ## 0.8.0-v2 (2026-09-10)
 
 - Fix `/bypass-classifier` feedback channels. Previously state/usage was returned via
